@@ -34,6 +34,7 @@ struct QuickPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if library.resizeHandleEdge == .top { resizeHandle }
             header
             search
             filters
@@ -48,7 +49,7 @@ struct QuickPanelView: View {
             }
             results
             footer
-            resizeHandle
+            if library.resizeHandleEdge == .bottom { resizeHandle }
         }
         .frame(width: 350)
         .frame(maxHeight: .infinity)
@@ -83,7 +84,17 @@ struct QuickPanelView: View {
             Text("cvMaster").font(.headline)
             Spacer()
             if library.paused {
-                Label("已暂停", systemImage: "pause.fill").font(.caption2).foregroundStyle(.secondary)
+                Button {
+                    library.paused = false
+                    library.notify("剪贴板记录已恢复")
+                } label: {
+                    Label("已暂停", systemImage: "pause.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(PanelButtonStyle())
+                .help("恢复记录")
+                .accessibilityLabel("恢复记录")
             }
             Menu {
                 Button(library.paused ? "恢复记录" : "暂停记录", systemImage: library.paused ? "play" : "pause") {
@@ -369,9 +380,10 @@ struct QuickPanelView: View {
         }
     }
 
-    /// 底部独立手柄只调整列表可用高度，不压缩顶部筛选或卡片字体。
+    /// 独立手柄位于远离状态图标的一侧，只调整列表可用高度，不压缩顶部筛选或卡片字体。
     private var resizeHandle: some View {
         PanelResizeHandle(
+            edge: library.resizeHandleEdge,
             currentHeight: { library.panelHeight },
             resize: { height, finished in library.resizePanel(to: height, persist: finished) },
             draggingChanged: { active in

@@ -174,6 +174,19 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         library.panelOpened()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+        updateResizeHandlePlacement()
+        // 等原生 popover 完成锚定后再测量一次，避免动画期间仍使用预估位置。
+        Task { @MainActor [weak self] in self?.updateResizeHandlePlacement() }
+    }
+
+    /// 按状态图标与浮层的实际屏幕位置，把手柄放到远离图标的一端。
+    private func updateResizeHandlePlacement() {
+        guard let button = statusItem?.button,
+              let iconWindow = button.window,
+              let panelWindow = popover.contentViewController?.view.window,
+              panelWindow.isVisible else { return }
+        let iconRect = iconWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        library.updateResizeHandleEdge(iconAbovePanel: iconRect.midY > panelWindow.frame.midY)
     }
 
     /// 在搜索框取得焦点前保存外部输入位置；未授权时不读取其他应用的辅助功能树。
@@ -366,6 +379,8 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     }
 
     func popoverDidClose(_ notification: Notification) { library.panelClosed() }
+
+    func popoverDidShow(_ notification: Notification) { updateResizeHandlePlacement() }
 
     func applicationWillTerminate(_ notification: Notification) {
         library.monitor?.stop()

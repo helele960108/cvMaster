@@ -1,0 +1,26 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <!-- 暖中性浅色主题：与 macOS 原型保持同一色彩语言。 -->
+  <SolidColorBrush x:Key="WindowBgBrush" Color="#FBFAF8" />
+  <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="SubtleBrush" Color="#F5F4F1" />
+  <SolidColorBrush x:Key="HoverBrush" Color="#EFEDE8" />
+  <SolidColorBrush x:Key="BorderBrush" Color="#E6E3DD" />
+  <SolidColorBrush x:Key="TextPrimaryBrush" Color="#302F2C" />
+  <SolidColorBrush x:Key="TextSecondaryBrush" Color="#73716A" />
+  <SolidColorBrush x:Key="TextMutedBrush" Color="#858179" />
+  <SolidColorBrush x:Key="AccentBrush" Color="#AC542E" />
+  <SolidColorBrush x:Key="AccentHoverBrush" Color="#914425" />
+  <SolidColorBrush x:Key="AccentSoftBrush" Color="#F6E9DF" />
+  <SolidColorBrush x:Key="AccentTextBrush" Color="#FFF9F3" />
+  <SolidColorBrush x:Key="SelectedBorderBrush" Color="#C78C66" />
+  <SolidColorBrush x:Key="SelectionBgBrush" Color="#FBF2EA" />
+  <SolidColorBrush x:Key="DangerBrush" Color="#B44139" />
+  <SolidColorBrush x:Key="GreenBrush" Color="#4C8066" />
+  <SolidColorBrush x:Key="SwitchOffBrush" Color="#B9B5AD" />
+  <SolidColorBrush x:Key="ScrollThumbBrush" Color="#CFCAC1" />
+  <SolidColorBrush x:Key="GroupColor0Brush" Color="#B17B50" />
+  <SolidColorBrush x:Key="GroupColor1Brush" Color="#849C7A" />
+  <SolidColorBrush x:Key="GroupColor2Brush" Color="#8C8EAE" />
+  <SolidColorBrush x:Key="GroupColor3Brush" Color="#9A9381" />
+</ResourceDictionary>

@@ -28,6 +28,8 @@ struct PanelButtonStyle: ButtonStyle {
 
 /// 原生手柄将高频鼠标事件限制为至多一个待执行更新，松开时立即提交最后尺寸。
 struct PanelResizeHandle: NSViewRepresentable {
+    /// 手柄所在边决定拖动方向：顶部手柄向上拖增高，底部手柄向下拖增高。
+    let edge: PanelResizeEdge
     /// 从容器读取实际高度，不依赖 SwiftUI 布局坐标。
     let currentHeight: () -> CGFloat
     /// finished 为 true 时写入用户偏好，其余仅修改原生窗口。
@@ -91,7 +93,7 @@ struct PanelResizeHandle: NSViewRepresentable {
         override func mouseDragged(with event: NSEvent) {
             guard dragging else { return }
             // 屏幕坐标不随 popover 移动；每次从起点计算，避免累计误差和回弹。
-            pendingHeight = startHeight + startY - NSEvent.mouseLocation.y
+            pendingHeight = requestedHeight()
             guard updateTask == nil else { return }
             updateTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(16))
@@ -103,8 +105,17 @@ struct PanelResizeHandle: NSViewRepresentable {
 
         override func mouseUp(with event: NSEvent) {
             guard dragging else { return }
-            pendingHeight = startHeight + startY - NSEvent.mouseLocation.y
+            pendingHeight = requestedHeight()
             finishDrag()
+        }
+
+        /// 顶部手柄向上拖动增高，底部手柄向下拖动增高；始终使用屏幕坐标计算。
+        private func requestedHeight() -> CGFloat {
+            let edge = callbacks?.edge ?? .bottom
+            let delta = edge == .top
+                ? NSEvent.mouseLocation.y - startY
+                : startY - NSEvent.mouseLocation.y
+            return startHeight + delta
         }
 
         override func viewWillMove(toWindow newWindow: NSWindow?) {

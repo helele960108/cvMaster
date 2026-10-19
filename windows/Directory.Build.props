@@ -1,0 +1,12 @@
+<Project>
+  <!-- 统一的编译约束：启用可空引用、最新语言特性与确定性构建。 -->
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <DebugType>embedded</DebugType>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+</Project>

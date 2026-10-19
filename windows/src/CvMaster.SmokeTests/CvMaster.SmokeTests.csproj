@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- 无 UI 的核心冒烟验证：使用临时目录，不接触真实剪贴板与用户历史。 -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>CvMaster.SmokeTests</RootNamespace>
+    <AssemblyName>CvMaster.SmokeTests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CvMaster.Core\CvMaster.Core.csproj" />
+  </ItemGroup>
+</Project>

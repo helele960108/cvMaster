@@ -7,6 +7,12 @@ import AppKit
 import SwiftUI
 import OSLog
 
+/// 缩放手柄所在的边；始终选择远离菜单栏图标的一端。
+enum PanelResizeEdge: Equatable {
+    case top
+    case bottom
+}
+
 @MainActor
 final class ClipboardLibrary: ObservableObject {
     static let accent = Color(red: 0.67, green: 0.33, blue: 0.18)
@@ -31,6 +37,16 @@ final class ClipboardLibrary: ObservableObject {
     }()
     /// 由原生容器限制实际可用屏幕高度并同步 popover 尺寸。
     var onResize: ((CGFloat) -> CGFloat)?
+    /// 由原生容器在浮层显示后按状态图标的实际位置更新。
+    @Published private(set) var resizeHandleEdge: PanelResizeEdge = .bottom
+
+    /// 图标位于浮层上方时手柄放底部，图标位于下方时手柄放顶部。
+    func updateResizeHandleEdge(iconAbovePanel: Bool) {
+        let edge: PanelResizeEdge = iconAbovePanel ? .bottom : .top
+        if resizeHandleEdge != edge {
+            resizeHandleEdge = edge
+        }
+    }
 
     func resizePanel(to height: CGFloat, persist: Bool = false) {
         guard height.isFinite else { return }

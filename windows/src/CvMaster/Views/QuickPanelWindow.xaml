@@ -1,0 +1,363 @@
+<Window x:Class="CvMaster.Views.QuickPanelWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:CvMaster.Controls"
+        Width="350"
+        Height="600"
+        MinHeight="420"
+        MaxHeight="1000"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        Topmost="True"
+        Background="{DynamicResource WindowBgBrush}"
+        FontFamily="{StaticResource AppFont}"
+        FontSize="13"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        Deactivated="Window_Deactivated"
+        Closing="Window_Closing"
+        LocationChanged="Window_LocationChanged"
+        PreviewKeyDown="Window_PreviewKeyDown"
+        SourceInitialized="Window_SourceInitialized">
+  <Border Background="{DynamicResource WindowBgBrush}"
+          BorderBrush="{DynamicResource BorderBrush}"
+          BorderThickness="1"
+          CornerRadius="14">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+
+      <!-- 缩放手柄由代码放到远离托盘图标的一侧，避免贴近任务栏和图标。 -->
+      <Border x:Name="ResizeGrip"
+              Grid.Row="2"
+              Height="14"
+              VerticalAlignment="Bottom"
+              Background="Transparent"
+              Cursor="SizeNS"
+              ToolTip="上下拖动调整列表高度"
+              AutomationProperties.Name="调整列表高度"
+              MouseLeftButtonDown="ResizeGrip_MouseLeftButtonDown"
+              MouseMove="ResizeGrip_MouseMove"
+              MouseLeftButtonUp="ResizeGrip_MouseLeftButtonUp">
+        <Border Width="38"
+                Height="4"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"
+                Background="{DynamicResource BorderBrush}"
+                CornerRadius="2" />
+      </Border>
+
+      <Grid Grid.Row="1">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+
+      <!-- 顶部品牌与更多入口 -->
+      <Grid Grid.Row="0" Margin="18,15,14,10">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <controls:Icon Width="17"
+                       Height="17"
+                       Data="{StaticResource Icon.Clipboard}"
+                       Foreground="{DynamicResource AccentBrush}" />
+        <TextBlock Grid.Column="1"
+                   Margin="7,0,0,0"
+                   VerticalAlignment="Center"
+                   FontSize="15"
+                   FontWeight="SemiBold"
+                   Foreground="{DynamicResource TextPrimaryBrush}"
+                   Text="cvMaster" />
+        <Button Grid.Column="3"
+                Margin="0,0,6,0"
+                VerticalAlignment="Center"
+                Style="{StaticResource StatusPillButtonStyle}"
+                ToolTip="点击恢复记录"
+                AutomationProperties.Name="恢复记录"
+                Visibility="{Binding PausedVisible, Converter={StaticResource BoolToVisibility}}"
+                Click="ResumeRecordingButton_Click">
+          <StackPanel Orientation="Horizontal">
+            <controls:Icon Width="9"
+                           Height="9"
+                           Margin="0,0,4,0"
+                           Data="{StaticResource Icon.Pause}"
+                           Foreground="{DynamicResource AccentBrush}" />
+            <TextBlock FontSize="10"
+                       Foreground="{DynamicResource AccentBrush}"
+                       Text="已暂停" />
+          </StackPanel>
+        </Button>
+        <Button Grid.Column="4"
+                Style="{StaticResource IconButtonStyle}"
+                ToolTip="更多操作"
+                AutomationProperties.Name="更多操作"
+                Click="MoreButton_Click">
+          <controls:Icon Data="{StaticResource Icon.More}" />
+        </Button>
+      </Grid>
+
+      <!-- 搜索与时间筛选 -->
+      <Border Grid.Row="1"
+              Margin="14,0,14,6"
+              Padding="9,6"
+              Background="{DynamicResource SurfaceBrush}"
+              BorderBrush="{DynamicResource BorderBrush}"
+              BorderThickness="1"
+              CornerRadius="9">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <controls:Icon Width="15"
+                         Height="15"
+                         VerticalAlignment="Center"
+                         Data="{StaticResource Icon.Search}"
+                         Foreground="{DynamicResource TextMutedBrush}" />
+          <Grid Grid.Column="1" Margin="7,0,0,0">
+            <TextBlock x:Name="SearchPlaceholder"
+                       VerticalAlignment="Center"
+                       FontSize="12"
+                       Foreground="{DynamicResource TextMutedBrush}"
+                       IsHitTestVisible="False"
+                       Text="{Binding SearchPlaceholder}" />
+            <TextBox x:Name="SearchBox"
+                     Style="{StaticResource SearchTextBoxStyle}"
+                     Text="{Binding Query, UpdateSourceTrigger=PropertyChanged}"
+                     TextChanged="SearchBox_TextChanged"
+                     PreviewKeyDown="SearchBox_PreviewKeyDown" />
+          </Grid>
+          <Button x:Name="ClearSearchButton"
+                  Grid.Column="2"
+                  Width="24"
+                  Height="24"
+                  Margin="2,0,0,0"
+                  Style="{StaticResource IconButtonStyle}"
+                  ToolTip="清除搜索"
+                  Visibility="Collapsed"
+                  Click="ClearSearchButton_Click">
+            <controls:Icon Width="13" Height="13" Data="{StaticResource Icon.Close}" />
+          </Button>
+          <Button x:Name="TimeFilterButton"
+                  Grid.Column="3"
+                  Width="28"
+                  Height="28"
+                  Style="{StaticResource IconButtonStyle}"
+                  ToolTip="时间筛选"
+                  Click="TimeFilterButton_Click">
+            <Grid>
+              <controls:Icon x:Name="TimeFilterIcon"
+                             Width="15"
+                             Height="15"
+                             Data="{StaticResource Icon.Clock}" />
+              <Border x:Name="TimeFilterDot"
+                      Width="5"
+                      Height="5"
+                      Margin="0,1,1,0"
+                      HorizontalAlignment="Right"
+                      VerticalAlignment="Top"
+                      Background="{DynamicResource AccentBrush}"
+                      CornerRadius="3"
+                      Visibility="Collapsed" />
+            </Grid>
+          </Button>
+        </Grid>
+      </Border>
+
+      <!-- 分组与类型筛选 -->
+      <StackPanel Grid.Row="2">
+        <Grid Margin="14,2,14,2">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <ScrollViewer HorizontalScrollBarVisibility="Hidden"
+                        VerticalScrollBarVisibility="Disabled">
+            <StackPanel x:Name="GroupChipsPanel" Orientation="Horizontal" />
+          </ScrollViewer>
+          <Button Grid.Column="1"
+                  Width="30"
+                  Height="30"
+                  Style="{StaticResource IconButtonStyle}"
+                  ToolTip="新建分组"
+                  Click="AddGroupButton_Click">
+            <controls:Icon Width="14" Height="14" Data="{StaticResource Icon.Plus}" />
+          </Button>
+        </Grid>
+        <StackPanel Margin="14,0,14,7" Orientation="Horizontal">
+          <Button x:Name="TypeAllButton"
+                  Style="{StaticResource ChipButtonStyle}"
+                  Click="TypeAllButton_Click"
+                  Content="全部类型" />
+          <Button x:Name="TypeTextButton"
+                  Style="{StaticResource ChipButtonStyle}"
+                  Click="TypeTextButton_Click"
+                  Content="文本" />
+          <Button x:Name="TypeLinkButton"
+                  Style="{StaticResource ChipButtonStyle}"
+                  Click="TypeLinkButton_Click"
+                  Content="链接" />
+          <Button x:Name="TypeImageButton"
+                  Style="{StaticResource ChipButtonStyle}"
+                  Click="TypeImageButton_Click"
+                  Content="图片" />
+          <Button x:Name="TypeFileButton"
+                  Style="{StaticResource ChipButtonStyle}"
+                  Click="TypeFileButton_Click"
+                  Content="文件" />
+        </StackPanel>
+        <Border Height="1" Margin="14,0" Background="{DynamicResource BorderBrush}" />
+      </StackPanel>
+
+      <!-- 首次使用且尚未开启记录时的明确入口 -->
+      <Border Grid.Row="3"
+              Padding="15,10"
+              Background="{DynamicResource AccentSoftBrush}"
+              Visibility="{Binding RecordingBannerVisible, Converter={StaticResource BoolToVisibility}}">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <TextBlock Margin="0,0,10,0"
+                     VerticalAlignment="Center"
+                     FontSize="11"
+                     Foreground="{DynamicResource TextSecondaryBrush}"
+                     Text="开启后自动保存新复制的内容，仅保存在本机。"
+                     TextWrapping="Wrap" />
+          <Button Grid.Column="1"
+                  Style="{StaticResource TextButtonStyle}"
+                  FontWeight="SemiBold"
+                  Click="EnableRecordingButton_Click"
+                  Content="开启记录" />
+        </Grid>
+      </Border>
+
+      <Grid Grid.Row="5">
+        <ListBox x:Name="ClipList"
+                 Style="{StaticResource ClipListStyle}"
+                 Padding="12,4,6,8"
+                 ItemsSource="{Binding RowsView}"
+                 SelectedItem="{Binding SelectedClip, Mode=TwoWay}"
+                 SelectionChanged="ClipList_SelectionChanged"
+                 MouseDoubleClick="ClipList_MouseDoubleClick"
+                 PreviewMouseRightButtonDown="ClipList_PreviewMouseRightButtonDown"
+                 ContextMenuOpening="ClipList_ContextMenuOpening">
+          <ListBox.GroupStyle>
+            <GroupStyle>
+              <GroupStyle.HeaderTemplate>
+                <DataTemplate>
+                  <Grid Margin="4,8,4,7">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="Auto" />
+                      <ColumnDefinition Width="Auto" />
+                      <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock FontSize="10"
+                               FontWeight="Medium"
+                               Foreground="{DynamicResource TextMutedBrush}"
+                               Text="{Binding Name}" />
+                    <TextBlock Grid.Column="1"
+                               Margin="6,0,0,0"
+                               FontSize="10"
+                               Foreground="{DynamicResource TextMutedBrush}">
+                      <Run Text="· " />
+                      <Run Text="{Binding ItemCount, Mode=OneWay}" />
+                    </TextBlock>
+                    <Border Grid.Column="2"
+                            Height="1"
+                            Margin="8,0,2,0"
+                            Background="{DynamicResource BorderBrush}" />
+                  </Grid>
+                </DataTemplate>
+              </GroupStyle.HeaderTemplate>
+            </GroupStyle>
+          </ListBox.GroupStyle>
+          <ListBox.ItemTemplate>
+            <DataTemplate>
+              <controls:ClipCard />
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+
+        <StackPanel HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    Visibility="{Binding IsEmptyVisible, Converter={StaticResource BoolToVisibility}}">
+          <controls:Icon Width="30"
+                         Height="30"
+                         Margin="0,0,0,10"
+                         Data="{StaticResource Icon.Layers}"
+                         Foreground="{DynamicResource TextMutedBrush}" />
+          <TextBlock HorizontalAlignment="Center"
+                     FontSize="13"
+                     FontWeight="Medium"
+                     Foreground="{DynamicResource TextPrimaryBrush}"
+                     Text="{Binding EmptyTitle}" />
+          <TextBlock Margin="0,6,0,0"
+                     HorizontalAlignment="Center"
+                     FontSize="11"
+                     Foreground="{DynamicResource TextSecondaryBrush}"
+                     Text="{Binding EmptyDescription}" />
+        </StackPanel>
+
+        <TextBlock HorizontalAlignment="Right"
+                   VerticalAlignment="Top"
+                   Margin="0,8,18,0"
+                   FontSize="10"
+                   Foreground="{DynamicResource TextMutedBrush}"
+                   Text="正在更新…"
+                   Visibility="{Binding IsLoading, Converter={StaticResource BoolToVisibility}}" />
+      </Grid>
+
+      <Button Grid.Row="6"
+              Margin="12,0,12,2"
+              HorizontalAlignment="Center"
+              Style="{StaticResource TextButtonStyle}"
+              Content="加载更多"
+              Visibility="{Binding HasMore, Converter={StaticResource BoolToVisibility}}"
+              Click="LoadMoreButton_Click" />
+
+      <Border Grid.Row="7"
+              BorderBrush="{DynamicResource BorderBrush}"
+              BorderThickness="0,1,0,0">
+        <Grid Margin="18,9,18,7">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+          </Grid.ColumnDefinitions>
+          <TextBlock VerticalAlignment="Center"
+                     FontSize="10"
+                     Foreground="{DynamicResource TextSecondaryBrush}"
+                     Text="{Binding StatusText}"
+                     TextTrimming="CharacterEllipsis" />
+          <TextBlock Grid.Column="1"
+                     VerticalAlignment="Center"
+                     FontSize="10"
+                     Foreground="{DynamicResource TextMutedBrush}"
+                     Text="{Binding ShortcutDisplay}" />
+        </Grid>
+      </Border>
+
+      </Grid>
+    </Grid>
+  </Border>
+</Window>

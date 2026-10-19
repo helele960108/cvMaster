@@ -1,0 +1,128 @@
+<UserControl x:Class="CvMaster.Controls.ClipCard"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:CvMaster.Controls"
+             x:Name="Root"
+             SnapsToDevicePixels="True">
+  <Border x:Name="Card" CornerRadius="13" Padding="13">
+    <Border.Style>
+      <Style TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Style.Triggers>
+          <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}"
+                       Value="True">
+            <Setter Property="BorderBrush" Value="{DynamicResource SelectedBorderBrush}" />
+          </DataTrigger>
+          <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}"
+                       Value="True">
+            <Setter Property="BorderBrush" Value="{DynamicResource SelectedBorderBrush}" />
+            <Setter Property="BorderThickness" Value="1.5" />
+            <Setter Property="Background" Value="{DynamicResource SelectionBgBrush}" />
+          </DataTrigger>
+        </Style.Triggers>
+      </Style>
+    </Border.Style>
+
+    <StackPanel>
+      <!-- 正文优先：内容在上，来源与时间沉底。 -->
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <Border x:Name="ThumbBorder"
+                Width="76"
+                Height="60"
+                Margin="0,0,12,0"
+                Background="{DynamicResource SubtleBrush}"
+                CornerRadius="8"
+                SnapsToDevicePixels="True"
+                Visibility="{Binding IsImage, Converter={StaticResource BoolToVisibility}}">
+          <Grid>
+            <controls:Icon x:Name="ThumbPlaceholder"
+                           Width="22"
+                           Height="22"
+                           Data="{StaticResource Icon.Image}"
+                           Foreground="{DynamicResource TextMutedBrush}" />
+          </Grid>
+        </Border>
+
+        <Border Width="48"
+                Height="54"
+                Margin="0,0,12,0"
+                Background="{DynamicResource AccentSoftBrush}"
+                CornerRadius="8"
+                Visibility="{Binding IsFile, Converter={StaticResource BoolToVisibility}}">
+          <controls:Icon Width="24"
+                         Height="24"
+                         Data="{StaticResource Icon.File}"
+                         Foreground="{DynamicResource AccentBrush}" />
+        </Border>
+
+        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+          <TextBlock MaxHeight="54"
+                     FontSize="12"
+                     FontWeight="Medium"
+                     Foreground="{DynamicResource TextPrimaryBrush}"
+                     LineHeight="18"
+                     Text="{Binding PrimaryText}"
+                     TextWrapping="Wrap"
+                     TextTrimming="CharacterEllipsis" />
+          <TextBlock MaxHeight="18"
+                     Margin="0,5,0,0"
+                     FontSize="11"
+                     Foreground="{DynamicResource TextSecondaryBrush}"
+                     Text="{Binding SecondaryText}"
+                     TextTrimming="CharacterEllipsis"
+                     Visibility="{Binding HasSecondary, Converter={StaticResource BoolToVisibility}}" />
+        </StackPanel>
+      </Grid>
+
+      <Grid Margin="0,9,0,0">
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <controls:SourceBadge ProcessName="{Binding Clip.SourceProcess}"
+                                DisplayName="{Binding Clip.Source}" />
+          <TextBlock Margin="5,0,0,0"
+                     MaxWidth="150"
+                     VerticalAlignment="Center"
+                     FontSize="10"
+                     Foreground="{DynamicResource TextSecondaryBrush}"
+                     Text="{Binding Clip.Source}"
+                     TextTrimming="CharacterEllipsis" />
+          <TextBlock Margin="4,0"
+                     VerticalAlignment="Center"
+                     FontSize="10"
+                     Foreground="{DynamicResource TextMutedBrush}"
+                     Text="·" />
+          <TextBlock VerticalAlignment="Center"
+                     FontSize="10"
+                     Foreground="{DynamicResource TextMutedBrush}"
+                     Text="{Binding RelativeTime}" />
+        </StackPanel>
+        <StackPanel HorizontalAlignment="Right"
+                    Orientation="Horizontal"
+                    VerticalAlignment="Center">
+          <controls:Icon Width="12"
+                         Height="12"
+                         Margin="0,0,5,0"
+                         Data="{StaticResource Icon.Pin}"
+                         Foreground="{DynamicResource AccentBrush}"
+                         Visibility="{Binding Clip.Pinned, Converter={StaticResource BoolToVisibility}}" />
+          <Button Width="20"
+                  Height="20"
+                  Style="{StaticResource IconButtonStyle}"
+                  ToolTip="预览内容"
+                  Click="PreviewButton_Click">
+            <controls:Icon Width="12"
+                           Height="12"
+                           Data="{Binding KindIcon}"
+                           Foreground="{DynamicResource TextMutedBrush}" />
+          </Button>
+        </StackPanel>
+      </Grid>
+    </StackPanel>
+  </Border>
+</UserControl>

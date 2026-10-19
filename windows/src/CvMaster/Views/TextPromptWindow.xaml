@@ -1,0 +1,82 @@
+<Window x:Class="CvMaster.Views.TextPromptWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:CvMaster.Controls"
+        Width="400"
+        SizeToContent="Height"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner"
+        Background="{DynamicResource WindowBgBrush}"
+        FontFamily="{StaticResource AppFont}"
+        FontSize="13"
+        TextOptions.TextFormattingMode="Display"
+        UseLayoutRounding="True"
+        SourceInitialized="Window_SourceInitialized"
+        Loaded="Window_Loaded">
+  <Border Background="{DynamicResource WindowBgBrush}"
+          BorderBrush="{DynamicResource BorderBrush}"
+          BorderThickness="1"
+          CornerRadius="14">
+    <Grid Margin="22">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+
+      <Grid Grid.Row="0"
+            Margin="0,0,0,14"
+            MouseLeftButtonDown="Header_MouseLeftButtonDown">
+        <TextBlock x:Name="TitleText"
+                   VerticalAlignment="Center"
+                   FontSize="17"
+                   FontWeight="SemiBold"
+                   Foreground="{DynamicResource TextPrimaryBrush}" />
+        <Button HorizontalAlignment="Right"
+                Style="{StaticResource IconButtonStyle}"
+                Click="CancelButton_Click">
+          <controls:Icon Width="14"
+                         Height="14"
+                         Data="{StaticResource Icon.Close}" />
+        </Button>
+      </Grid>
+
+      <TextBlock x:Name="DescriptionText"
+                 Grid.Row="1"
+                 Margin="0,0,0,12"
+                 FontSize="11"
+                 Foreground="{DynamicResource TextSecondaryBrush}"
+                 TextWrapping="Wrap" />
+
+      <TextBox x:Name="Input"
+               Grid.Row="2"
+               Style="{StaticResource DialogTextBoxStyle}"
+               KeyDown="Input_KeyDown" />
+
+      <TextBlock x:Name="ErrorText"
+                 Grid.Row="3"
+                 Margin="0,7,0,0"
+                 FontSize="10"
+                 Foreground="{DynamicResource DangerBrush}"
+                 TextWrapping="Wrap"
+                 Visibility="Collapsed" />
+
+      <StackPanel Grid.Row="4"
+                  Margin="0,20,0,0"
+                  HorizontalAlignment="Right"
+                  Orientation="Horizontal">
+        <Button Margin="0,0,8,0"
+                Style="{StaticResource SecondaryButtonStyle}"
+                Click="CancelButton_Click"
+                Content="取消" />
+        <Button Style="{StaticResource PrimaryButtonStyle}"
+                Click="SaveButton_Click"
+                Content="保存" />
+      </StackPanel>
+    </Grid>
+  </Border>
+</Window>

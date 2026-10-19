@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Windows 原生壳层：WPF + 事件驱动剪贴板监听，不依赖 WebView / 网络。 -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>cvMaster</AssemblyName>
+    <RootNamespace>CvMaster</RootNamespace>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>0.1.0</Version>
+    <FileVersion>0.1.0.0</FileVersion>
+    <Product>cvMaster</Product>
+    <Company>helele</Company>
+    <Description>本地优先的 Windows 剪贴板管理工具</Description>
+    <Authors>helele</Authors>
+    <Copyright>© 2026 helele</Copyright>
+    <SatelliteResourceLanguages>zh-Hans;en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CvMaster.Core\CvMaster.Core.csproj" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Assets\app.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Assets\app.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>

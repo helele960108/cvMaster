@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CvMaster.Core/CvMaster.Core.csproj" />
+    <Project Path="src/CvMaster.SmokeTests/CvMaster.SmokeTests.csproj" />
+    <Project Path="src/CvMaster/CvMaster.csproj" />
+  </Folder>
+</Solution>
