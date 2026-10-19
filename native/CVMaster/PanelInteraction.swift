@@ -1,0 +1,126 @@
+/**
+ * 紧凑浮层交互：局部按钮悬停反馈与屏幕坐标驱动的原生缩放手柄。
+ * @author helele
+ * @since 2026-10-19
+ */
+import AppKit
+import SwiftUI
+
+/// 悬停仅更新按钮自身，不发布共享状态或触发历史查询；禁用时不显示交互高亮。
+struct PanelButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Feedback(configuration: configuration)
+    }
+
+    private struct Feedback: View {
+        let configuration: ButtonStyle.Configuration
+        @Environment(\.isEnabled) private var enabled
+        @ViewState<Bool> private var hovered = false
+
+        var body: some View {
+            configuration.label
+                .background(ClipboardLibrary.accent.opacity(enabled ? (configuration.isPressed ? 0.18 : hovered ? 0.09 : 0) : 0),
+                            in: RoundedRectangle(cornerRadius: 7))
+                .onHover { hovered = $0 }
+        }
+    }
+}
+
+/// 原生手柄将高频鼠标事件限制为至多一个待执行更新，松开时立即提交最后尺寸。
+struct PanelResizeHandle: NSViewRepresentable {
+    /// 从容器读取实际高度，不依赖 SwiftUI 布局坐标。
+    let currentHeight: () -> CGFloat
+    /// finished 为 true 时写入用户偏好，其余仅修改原生窗口。
+    let resize: (CGFloat, Bool) -> Void
+    /// 仅开始、结束通知 SwiftUI，拖动期间阻止侧边预览。
+    let draggingChanged: (Bool) -> Void
+
+    func makeNSView(context: Context) -> GripView {
+        let view = GripView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ view: GripView, context: Context) {
+        view.callbacks = self
+    }
+
+    final class GripView: NSView {
+        var callbacks: PanelResizeHandle?
+        private var tracking: NSTrackingArea?
+        private var hovered = false
+        private var dragging = false
+        private var startY: CGFloat = 0
+        private var startHeight: CGFloat = 0
+        private var pendingHeight: CGFloat = 0
+        /// 最多保留一个约 60 Hz 更新任务，无事件队列积压。
+        private var updateTask: Task<Void, Never>?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let tracking { removeTrackingArea(tracking) }
+            let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+            addTrackingArea(area)
+            tracking = area
+        }
+
+        override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeUpDown) }
+        override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
+        override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
+
+        override func draw(_ dirtyRect: NSRect) {
+            let active = hovered || dragging
+            if active {
+                NSColor.controlAccentColor.withAlphaComponent(0.09).setFill()
+                NSBezierPath(roundedRect: bounds.insetBy(dx: 7, dy: 1), xRadius: 5, yRadius: 5).fill()
+            }
+            (active ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor).setFill()
+            NSBezierPath(roundedRect: NSRect(x: bounds.midX - 19, y: bounds.midY - 2, width: 38, height: 4), xRadius: 2, yRadius: 2).fill()
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            guard let callbacks else { return }
+            startY = NSEvent.mouseLocation.y
+            startHeight = callbacks.currentHeight()
+            pendingHeight = startHeight
+            dragging = true
+            callbacks.draggingChanged(true)
+            needsDisplay = true
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard dragging else { return }
+            // 屏幕坐标不随 popover 移动；每次从起点计算，避免累计误差和回弹。
+            pendingHeight = startHeight + startY - NSEvent.mouseLocation.y
+            guard updateTask == nil else { return }
+            updateTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(16))
+                guard !Task.isCancelled, let self, self.dragging else { return }
+                self.updateTask = nil
+                self.callbacks?.resize(self.pendingHeight, false)
+            }
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            guard dragging else { return }
+            pendingHeight = startHeight + startY - NSEvent.mouseLocation.y
+            finishDrag()
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil { finishDrag() }
+            super.viewWillMove(toWindow: newWindow)
+        }
+
+        /// 关闭浮层时也取消待执行更新，不让旧任务修改下次打开的窗口。
+        private func finishDrag() {
+            updateTask?.cancel()
+            updateTask = nil
+            guard dragging else { return }
+            dragging = false
+            callbacks?.resize(pendingHeight, true)
+            callbacks?.draggingChanged(false)
+            needsDisplay = true
+        }
+    }
+}
