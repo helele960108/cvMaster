@@ -365,10 +365,15 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private func presentPasteFailureIfSafe() {
         clearPreparedPasteTarget()
         pasteHandoff.finishRequest()
-        guard pasteHandoff.mayPresentFailure, let application = pasteApplication,
+        guard pasteHandoff.mayPresentFailure, let application = pasteApplication, !application.isTerminated,
               let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier,
               frontmost == application.processIdentifier || frontmost == ProcessInfo.processInfo.processIdentifier,
               !popover.isShown, let button = statusItem?.button else { return }
+        // 失败前的面板已关闭，旧请求也已结束；重试必须创建新的会话，不能复活旧准备许可。
+        // 仅沿用上面验证仍在前台（或本应用临时持有前台）的目标，不收养第三方应用。
+        pasteTargetID = UUID()
+        pasteHandoff.panelWillOpen(targetID: pasteTargetID, processIdentifier: application.processIdentifier,
+                                   frontmostProcessIdentifier: frontmost)
         library.panelOpened()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }

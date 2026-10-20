@@ -919,9 +919,87 @@ private struct RegressionChecks {
                         && !interrupted.mayPresentFailure, "Invalidated \(event) request was rebound or allowed focus-stealing failure UI")
         }
 
+        // Duplicate close delivery is idempotent after intentional closure, both while restoring and prepared.
+        for prepared in [false, true] {
+            var duplicateClose = try restoring()
+            if prepared {
+                duplicateClose.applicationActivated(original)
+                try require(duplicateClose.markPrepared(targetID: target), "Duplicate-close fixture was not prepared")
+            }
+            let dismissal = duplicateClose.dismissalGeneration
+            duplicateClose.panelDidClose()
+            try require(duplicateClose.dismissalGeneration == dismissal && duplicateClose.mayPresentFailure,
+                        "Duplicate close changed the dismissal generation or invalidated the request")
+            if prepared {
+                try require(duplicateClose.isPrepared(targetID: target, frontmostProcessIdentifier: original),
+                            "Duplicate close invalidated a prepared request")
+            } else {
+                duplicateClose.applicationActivated(original)
+                try require(duplicateClose.markPrepared(targetID: target),
+                            "Duplicate close prevented a restoring request from completing")
+            }
+        }
+
+        // Current-active confirmation does not require a duplicate activation event, but never adopts another target.
+        var currentActive = try restoring()
+        let activeGeneration = currentActive.focusGeneration
+        try require(currentActive.confirmActiveTarget(targetID: target, frontmostProcessIdentifier: original,
+                                                      targetIsActive: true)
+                    && currentActive.focusGeneration == activeGeneration && currentActive.markPrepared(targetID: target)
+                    && currentActive.isPrepared(targetID: target, frontmostProcessIdentifier: original),
+                    "Stable active target could not prepare without a duplicate activation notification")
+        for mismatch in ["target", "frontmost", "unknown-frontmost", "inactive", "not-closed", "third-party", "finished"] {
+            var policy = try restoring()
+            if mismatch == "not-closed" {
+                policy = try loading()
+                try require(policy.beginPreparation(targetID: target, frontmostProcessIdentifier: own,
+                                                     ownApplicationIsActive: true, panelIsShown: true),
+                            "Unclosed confirmation fixture could not prepare")
+            } else if mismatch == "third-party" {
+                policy.applicationActivated(unrelated)
+                policy.applicationActivated(original)
+            } else if mismatch == "finished" {
+                policy.finishRequest()
+            }
+            let frontmost: Int32? = mismatch == "unknown-frontmost" ? nil : mismatch == "frontmost" ? unrelated : original
+            try require(!policy.confirmActiveTarget(targetID: mismatch == "target" ? otherTarget : target,
+                                                    frontmostProcessIdentifier: frontmost,
+                                                    targetIsActive: mismatch != "inactive"),
+                        "Current-active confirmation accepted \(mismatch)")
+        }
+
+        // Reopening after failure creates a fresh panel and request; closing that new panel still invalidates it.
+        var retry = try restoring()
+        retry.finishRequest()
+        let retryTarget = UUID()
+        let previousPanel = retry.panelGeneration
+        retry.panelWillOpen(targetID: retryTarget, processIdentifier: original, frontmostProcessIdentifier: original)
+        try require(retry.panelGeneration == previousPanel + 1
+                    && retry.beginRequest(targetID: retryTarget, processIdentifier: original,
+                                          frontmostProcessIdentifier: original, panelIsShown: true),
+                    "Reopened failure panel could not start a fresh request")
+        try require(!retry.isPrepared(targetID: target, frontmostProcessIdentifier: original),
+                    "Reopened failure panel retained the previous preparation")
+        var successfulRetry = retry
+        try require(successfulRetry.beginPreparation(targetID: retryTarget, frontmostProcessIdentifier: original,
+                                                      ownApplicationIsActive: false, panelIsShown: true),
+                    "Reopened failure panel could not prepare its fresh request")
+        successfulRetry.panelDidClose()
+        try require(successfulRetry.confirmActiveTarget(targetID: retryTarget, frontmostProcessIdentifier: original,
+                                                        targetIsActive: true)
+                    && successfulRetry.markPrepared(targetID: retryTarget)
+                    && successfulRetry.isPrepared(targetID: retryTarget, frontmostProcessIdentifier: original),
+                    "Fresh retry request could not complete preparation")
+        retry.panelDidClose()
+        try require(!retry.beginPreparation(targetID: retryTarget, frontmostProcessIdentifier: original,
+                                            ownApplicationIsActive: false, panelIsShown: false)
+                    && !retry.confirmActiveTarget(targetID: retryTarget, frontmostProcessIdentifier: original,
+                                                  targetIsActive: true),
+                    "Closing the new failure panel did not invalidate its request")
+
         // Unexpected transitions while restoring or prepared cannot be repaired by returning to A.
         for phase in ["restoring", "prepared"] {
-            for event in ["switch-back", "close", "duplicate-target", "unknown"] {
+            for event in ["switch-back", "duplicate-target", "unknown"] {
                 var interrupted = try restoring()
                 if phase == "prepared" || event == "duplicate-target" {
                     interrupted.applicationActivated(original)
@@ -931,7 +1009,6 @@ private struct RegressionChecks {
                 }
                 switch event {
                 case "switch-back": interrupted.applicationActivated(unrelated); interrupted.applicationActivated(original)
-                case "close": interrupted.panelDidClose()
                 case "duplicate-target": interrupted.applicationActivated(original)
                 default: interrupted.applicationActivated(nil)
                 }
