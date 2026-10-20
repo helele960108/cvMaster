@@ -17,6 +17,7 @@ public sealed class SettingsService
     private const string DefaultExclusions = "1Password.exe\nBitwarden.exe\nKeePass.exe\nKeePassXC.exe";
 
     private bool _recordingEnabled;
+    private bool _paused;
     private bool _autoPaste = true;
     private bool _skipSensitive = true;
     private bool _runAtStartup;
@@ -44,6 +45,22 @@ public sealed class SettingsService
 
             _recordingEnabled = value;
             WriteDword("RecordingEnabled", value ? 1 : 0);
+        }
+    }
+
+    /// <summary>暂停状态跨重启保存；恢复时重置序列基线，不补录暂停期间内容。</summary>
+    public bool Paused
+    {
+        get => _paused;
+        set
+        {
+            if (_paused == value)
+            {
+                return;
+            }
+
+            _paused = value;
+            WriteDword("Paused", value ? 1 : 0);
         }
     }
 
@@ -273,6 +290,7 @@ public sealed class SettingsService
             if (key is not null)
             {
                 _recordingEnabled = ReadDword(key, "RecordingEnabled") == 1;
+                _paused = ReadDword(key, "Paused") == 1;
                 _autoPaste = ReadDword(key, "AutoPaste", 1) == 1;
                 _skipSensitive = ReadDword(key, "SkipSensitive", 1) == 1;
                 _runAtStartup = ReadDword(key, "RunAtStartup") == 1;

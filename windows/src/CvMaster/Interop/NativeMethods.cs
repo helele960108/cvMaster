@@ -57,8 +57,7 @@ internal static class NativeMethods
     public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
     public const int DWMWCP_ROUND = 2;
 
-    public const uint SHGFI_ICON = 0x00000100;
-    public const uint SHGFI_SMALLICON = 0x00000001;
+    public const uint SHGFI_ICON = 0x00000100;    public const uint SHGFI_SMALLICON = 0x00000001;
     public const uint SHGFI_USEFILEATTRIBUTES = 0x00000010;
     public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
     public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
@@ -66,6 +65,7 @@ internal static class NativeMethods
     public const int TokenIntegrityLevel = 25;
     public const uint WINEVENT_OUTOFCONTEXT = 0;
     public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    public const uint DESKTOP_READOBJECTS = 0x0001;
     public static readonly IntPtr HWND_MESSAGE = new(-3);
     public static readonly IntPtr IDI_APPLICATION = new(32512);
 
@@ -296,6 +296,14 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool IsWindow(IntPtr hWnd);
+
+    /// <summary>锁屏 / UAC 等安全桌面激活时返回空；普通桌面返回可关闭的句柄。</summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseDesktop(IntPtr hDesktop);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

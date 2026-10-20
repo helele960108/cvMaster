@@ -6,8 +6,10 @@
  */
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Data.Sqlite;
+using Microsoft.Win32.SafeHandles;
 
 namespace CvMaster.Core;
 
@@ -99,8 +101,18 @@ public sealed class HistoryStore : IAsyncDisposable
     public Task<int> ClearAsync(DateTimeOffset? before, CancellationToken cancellationToken = default) =>
         RunAsync(() => ClearCore(before), cancellationToken);
 
-    public Task<IReadOnlyList<ClipRepresentation>> GetRepresentationsAsync(Guid id, CancellationToken cancellationToken = default) =>
-        RunAsync(() => (IReadOnlyList<ClipRepresentation>)RepresentationsCore(id), cancellationToken);
+    /// <summary>
+    /// 读取完整原始表示并确认文件引用仍可用。
+    /// 外部文件检查在串行存储队列之外执行，异常挂载点不会阻塞其他查询。
+    /// </summary>
+    public async Task<IReadOnlyList<ClipRepresentation>> GetRepresentationsAsync(Guid id, CancellationToken cancellationToken = default)
+    {
+        var representations = await RunAsync(
+            () => (IReadOnlyList<ClipRepresentation>)RepresentationsCore(id),
+            cancellationToken).ConfigureAwait(false);
+        await EnsureFileReferencesAvailableAsync(representations, cancellationToken).ConfigureAwait(false);
+        return representations;
+    }
 
     public Task<IReadOnlyList<ClipRepresentation>> GetPlainTextAsync(Guid id, ClipKind kind, CancellationToken cancellationToken = default) =>
         RunAsync(() => (IReadOnlyList<ClipRepresentation>)PlainTextCore(id, kind), cancellationToken);
@@ -175,6 +187,20 @@ public sealed class HistoryStore : IAsyncDisposable
     {
         Directory.CreateDirectory(RootDirectory);
         Directory.CreateDirectory(AssetsDirectory);
+
+        // 数据目录与数据库必须是普通路径；重解析点会把读写引到目录之外。
+        if (IsReparsePoint(RootDirectory) || IsReparsePoint(AssetsDirectory) || IsReparsePoint(DatabasePath))
+        {
+            throw new LibraryException(LibraryErrorCode.Storage);
+        }
+
+        foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+        {
+            if (IsReparsePoint(DatabasePath + suffix))
+            {
+                throw new LibraryException(LibraryErrorCode.Storage);
+            }
+        }
 
         var builder = new SqliteConnectionStringBuilder
         {
@@ -495,23 +521,9 @@ public sealed class HistoryStore : IAsyncDisposable
 
         var fingerprint = Fingerprint.Compute(capture.Representations);
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var existing = ScalarLong("SELECT COUNT(*) FROM entry WHERE fingerprint=@fingerprint", ("@fingerprint", fingerprint));
-        if (existing > 0)
-        {
-            using var update = CreateCommand(
-                "UPDATE entry SET copied_at=@now,copies=copies+1,source=@source,source_process=@process WHERE fingerprint=@fingerprint",
-                ("@now", now),
-                ("@source", source),
-                ("@process", sourceProcess),
-                ("@fingerprint", fingerprint));
-            update.ExecuteNonQuery();
-            return;
-        }
-
-        PruneCore(Math.Max(0, retentionDays), totalBytes);
-
         var entryId = Guid.NewGuid();
         var written = new List<string>();
+        var removed = new List<string>();
         try
         {
             using (var begin = CreateCommand("BEGIN IMMEDIATE"))
@@ -519,43 +531,63 @@ public sealed class HistoryStore : IAsyncDisposable
                 begin.ExecuteNonQuery();
             }
 
-            using (var insert = CreateCommand(
-                       """
-                       INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,source_process,copied_at,byte_size)
-                       VALUES(@id,@fingerprint,@kind,@title,@excerpt,@search,@source,@process,@now,@bytes)
-                       """,
-                       ("@id", entryId.ToString("D")),
-                       ("@fingerprint", fingerprint),
-                       ("@kind", capture.Kind.ToStorageValue()),
-                       ("@title", title),
-                       ("@excerpt", excerpt),
-                       ("@search", searchText),
-                       ("@source", source),
-                       ("@process", sourceProcess),
-                       ("@now", now),
-                       ("@bytes", totalBytes)))
+            var duplicate = ScalarLong(
+                "SELECT COUNT(*) FROM entry WHERE fingerprint=@fingerprint",
+                ("@fingerprint", fingerprint)) > 0;
+            if (duplicate)
             {
-                insert.ExecuteNonQuery();
+                using var update = CreateCommand(
+                    "UPDATE entry SET copied_at=@now,copies=copies+1,source=@source,source_process=@process WHERE fingerprint=@fingerprint",
+                    ("@now", now),
+                    ("@source", source),
+                    ("@process", sourceProcess),
+                    ("@fingerprint", fingerprint));
+                update.ExecuteNonQuery();
             }
 
-            foreach (var representation in capture.Representations)
+            // 清理与去重 / 入库共享事务：失败时旧记录和旧资产保持不变。
+            removed.AddRange(PruneCore(Math.Max(0, retentionDays), duplicate ? 0 : totalBytes, addingEntry: !duplicate));
+
+            if (!duplicate)
             {
-                var assetId = Guid.NewGuid().ToString("N");
-                var path = Path.Combine(AssetsDirectory, assetId);
-                WriteAsset(path, representation.Data);
-                written.Add(path);
-                using var insert = CreateCommand(
-                    """
-                    INSERT INTO representation(id,entry_id,item_order,type,filename,byte_size)
-                    VALUES(@id,@entry,@item,@type,@filename,@bytes)
-                    """,
-                    ("@id", Guid.NewGuid().ToString("D")),
-                    ("@entry", entryId.ToString("D")),
-                    ("@item", representation.Item),
-                    ("@type", representation.Type),
-                    ("@filename", assetId),
-                    ("@bytes", representation.Data.Length));
-                insert.ExecuteNonQuery();
+                using (var insert = CreateCommand(
+                           """
+                           INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,source_process,copied_at,byte_size)
+                           VALUES(@id,@fingerprint,@kind,@title,@excerpt,@search,@source,@process,@now,@bytes)
+                           """,
+                           ("@id", entryId.ToString("D")),
+                           ("@fingerprint", fingerprint),
+                           ("@kind", capture.Kind.ToStorageValue()),
+                           ("@title", title),
+                           ("@excerpt", excerpt),
+                           ("@search", searchText),
+                           ("@source", source),
+                           ("@process", sourceProcess),
+                           ("@now", now),
+                           ("@bytes", totalBytes)))
+                {
+                    insert.ExecuteNonQuery();
+                }
+
+                foreach (var representation in capture.Representations)
+                {
+                    var assetId = Guid.NewGuid().ToString("N");
+                    var path = Path.Combine(AssetsDirectory, assetId);
+                    WriteAsset(path, representation.Data);
+                    written.Add(path);
+                    using var insert = CreateCommand(
+                        """
+                        INSERT INTO representation(id,entry_id,item_order,type,filename,byte_size)
+                        VALUES(@id,@entry,@item,@type,@filename,@bytes)
+                        """,
+                        ("@id", Guid.NewGuid().ToString("D")),
+                        ("@entry", entryId.ToString("D")),
+                        ("@item", representation.Item),
+                        ("@type", representation.Type),
+                        ("@filename", assetId),
+                        ("@bytes", representation.Data.Length));
+                    insert.ExecuteNonQuery();
+                }
             }
 
             using (var commit = CreateCommand("COMMIT"))
@@ -575,15 +607,21 @@ public sealed class HistoryStore : IAsyncDisposable
             DeleteAssets(written);
             throw new LibraryException(LibraryErrorCode.Storage, exception);
         }
+
+        // 提交成功后才回收旧资产，避免回滚时误删仍被引用的文件。
+        DeleteAssets(removed.Select(AssetPath).OfType<string>());
     }
 
-    /// <summary>清理仅删除非保护记录；保护内容占满容量时拒绝新内容。</summary>
-    private void PruneCore(int retentionDays, long incomingBytes)
+    /// <summary>
+    /// 清理仅删除非保护记录；保护内容占满容量时拒绝新内容。
+    /// 只修改数据库并返回待回收的资产名，调用方在事务提交后删除文件。
+    /// </summary>
+    private List<string> PruneCore(int retentionDays, long incomingBytes, bool addingEntry)
     {
         const string protectedFilter = "pinned=1 OR EXISTS(SELECT 1 FROM entry_group WHERE entry_id=entry.id)";
         var protectedCount = ScalarLong($"SELECT COUNT(*) FROM entry WHERE {protectedFilter}");
         var protectedBytes = ScalarLong($"SELECT COALESCE(SUM(byte_size),0) FROM entry WHERE {protectedFilter}");
-        if (protectedCount >= StorageLimits.MaximumEntries ||
+        if (protectedCount + (addingEntry ? 1 : 0) > StorageLimits.MaximumEntries ||
             protectedBytes + incomingBytes > StorageLimits.MaximumBytes)
         {
             throw new LibraryException(LibraryErrorCode.Capacity);
@@ -594,48 +632,83 @@ public sealed class HistoryStore : IAsyncDisposable
             : long.MinValue;
         var count = ScalarLong("SELECT COUNT(*) FROM entry");
         var bytes = ScalarLong("SELECT COALESCE(SUM(byte_size),0) FROM entry");
+        var removed = new List<string>();
 
         while (true)
         {
-            var overBudget = count >= StorageLimits.MaximumEntries ||
-                             bytes + incomingBytes > StorageLimits.MaximumBytes;
-            Guid? candidate = null;
-            long candidateBytes = 0;
+            var candidates = new List<(Guid Id, long Bytes)>();
+            var plannedCount = count;
+            var plannedBytes = bytes;
             using (var select = CreateCommand(
                        """
-                       SELECT id,byte_size FROM entry
+                       SELECT id,byte_size,copied_at FROM entry
                        WHERE pinned=0
                          AND NOT EXISTS(SELECT 1 FROM entry_group WHERE entry_id=entry.id)
-                         AND (@force=1 OR copied_at<@cutoff)
                        ORDER BY copied_at
-                       LIMIT 1
-                       """,
-                       ("@force", overBudget ? 1 : 0),
-                       ("@cutoff", cutoff)))
+                       LIMIT 128
+                       """))
             using (var reader = select.ExecuteReader())
             {
-                if (reader.Read() && Guid.TryParse(reader.GetString(0), out var id))
+                while (reader.Read())
                 {
-                    candidate = id;
-                    candidateBytes = reader.GetInt64(1);
+                    var overBudget = plannedCount + (addingEntry ? 1 : 0) > StorageLimits.MaximumEntries ||
+                                     plannedBytes + incomingBytes > StorageLimits.MaximumBytes;
+                    var copiedAt = reader.GetInt64(2);
+                    if (!overBudget && copiedAt >= cutoff)
+                    {
+                        break;
+                    }
+
+                    if (!Guid.TryParse(reader.GetString(0), out var id))
+                    {
+                        throw new LibraryException(LibraryErrorCode.Storage);
+                    }
+
+                    var size = reader.GetInt64(1);
+                    candidates.Add((id, size));
+                    plannedCount--;
+                    plannedBytes -= size;
                 }
             }
 
-            if (candidate is null)
+            if (candidates.Count == 0)
             {
                 break;
             }
 
-            DeleteEntryCore(candidate.Value);
-            count--;
-            bytes -= candidateBytes;
+            var idParameters = candidates
+                .Select((candidate, index) => ($"@id{index}", (object?)candidate.Id.ToString("D")))
+                .ToArray();
+            var inClause = string.Join(",", idParameters.Select(item => item.Item1));
+            using (var assets = CreateCommand(
+                       $"SELECT filename FROM representation WHERE entry_id IN ({inClause})",
+                       idParameters))
+            using (var reader = assets.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    removed.Add(reader.GetString(0));
+                }
+            }
+
+            using (var delete = CreateCommand(
+                       $"DELETE FROM entry WHERE id IN ({inClause})",
+                       idParameters))
+            {
+                delete.ExecuteNonQuery();
+            }
+
+            count = plannedCount;
+            bytes = plannedBytes;
         }
 
-        if (count >= StorageLimits.MaximumEntries ||
+        if (count + (addingEntry ? 1 : 0) > StorageLimits.MaximumEntries ||
             bytes + incomingBytes > StorageLimits.MaximumBytes)
         {
             throw new LibraryException(LibraryErrorCode.Capacity);
         }
+
+        return removed;
     }
 
     private void DeleteEntryCore(Guid id)
@@ -682,18 +755,53 @@ public sealed class HistoryStore : IAsyncDisposable
             return 0;
         }
 
-        using (var delete = before is null
-                   ? CreateCommand("DELETE FROM entry")
-                   : CreateCommand(
-                       "DELETE FROM entry WHERE copied_at<@cutoff",
-                       ("@cutoff", before.Value.ToUnixTimeMilliseconds())))
+        try
         {
-            delete.ExecuteNonQuery();
+            using (var begin = CreateCommand("BEGIN IMMEDIATE"))
+            {
+                begin.ExecuteNonQuery();
+            }
+
+            using (var delete = before is null
+                       ? CreateCommand("DELETE FROM entry")
+                       : CreateCommand(
+                           "DELETE FROM entry WHERE copied_at<@cutoff",
+                           ("@cutoff", before.Value.ToUnixTimeMilliseconds())))
+            {
+                delete.ExecuteNonQuery();
+            }
+
+            using (var commit = CreateCommand("COMMIT"))
+            {
+                commit.ExecuteNonQuery();
+            }
+        }
+        catch (Exception exception)
+        {
+            TryRollback();
+            throw new LibraryException(LibraryErrorCode.Storage, exception);
         }
 
-        RecoverAssetsCore();
-        ExecutePragma("PRAGMA wal_checkpoint(TRUNCATE)");
-        ExecutePragma("VACUUM");
+        // 删除提交即成功边界；资产回收与 checkpoint 失败不伪装成删除回滚。
+        // 不执行 VACUUM：空闲页留待复用，避免长时间阻塞和其他查询饥饿。
+        try
+        {
+            RecoverAssetsCore();
+        }
+        catch (Exception)
+        {
+            // 启动恢复会再次回收孤立资产。
+        }
+
+        try
+        {
+            ExecutePragma("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+        catch (Exception)
+        {
+            // checkpoint 失败不影响已提交的删除。
+        }
+
         return removed;
     }
 
@@ -775,7 +883,7 @@ public sealed class HistoryStore : IAsyncDisposable
             }
 
             var path = AssetPath(filename);
-            if (path is null || !File.Exists(path) || new FileInfo(path).Length != expected)
+            if (path is null || !IsSafeAssetFile(path, expected))
             {
                 throw new LibraryException(LibraryErrorCode.MissingContent);
             }
@@ -790,17 +898,6 @@ public sealed class HistoryStore : IAsyncDisposable
                 throw new LibraryException(LibraryErrorCode.MissingContent, exception);
             }
 
-            if (type == "windows/file-list")
-            {
-                foreach (var file in DecodeFileList(data))
-                {
-                    if (!File.Exists(file) && !Directory.Exists(file))
-                    {
-                        throw new LibraryException(LibraryErrorCode.UnavailableFile);
-                    }
-                }
-            }
-
             result.Add(new ClipRepresentation(reader.GetInt32(0), type, data));
         }
 
@@ -810,6 +907,41 @@ public sealed class HistoryStore : IAsyncDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// 文件引用可读性检查可能因断开的网络卷或异常磁盘永久阻塞，
+    /// 因此只在串行存储队列之外等待，超过 3 秒按“原文件不可用”处理。
+    /// </summary>
+    private static async Task EnsureFileReferencesAvailableAsync(
+        IReadOnlyList<ClipRepresentation> representations,
+        CancellationToken cancellationToken)
+    {
+        var files = representations
+            .Where(item => item.Type == "windows/file-list")
+            .SelectMany(item => DecodeFileList(item.Data))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (files.Length == 0)
+        {
+            return;
+        }
+
+        var check = Task.Run(
+            () => files.All(path => File.Exists(path) || Directory.Exists(path)),
+            CancellationToken.None);
+        var timeout = Task.Delay(TimeSpan.FromSeconds(3), cancellationToken);
+        var completed = await Task.WhenAny(check, timeout).ConfigureAwait(false);
+        if (completed != check)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new LibraryException(LibraryErrorCode.UnavailableFile);
+        }
+
+        if (!await check.ConfigureAwait(false))
+        {
+            throw new LibraryException(LibraryErrorCode.UnavailableFile);
+        }
     }
 
     private List<ClipRepresentation> PlainTextCore(Guid id, ClipKind kind)
@@ -822,6 +954,7 @@ public sealed class HistoryStore : IAsyncDisposable
         var originals = RepresentationsCore(id);
         var parts = new List<string>();
         long bytes = 0;
+        var richTextBudget = StorageLimits.MaximumRichTextPreviewBytes;
         foreach (var itemIndex in originals.Select(item => item.Item).Distinct().OrderBy(item => item))
         {
             var items = originals.Where(item => item.Item == itemIndex).ToList();
@@ -837,9 +970,19 @@ public sealed class HistoryStore : IAsyncDisposable
                         ?? DecodeText(items.FirstOrDefault(item => item.Type == "text/url")?.Data);
             }
 
-            value ??= TextExtraction.FromRtf(
-                items.FirstOrDefault(item => item.Type == "text/rtf")?.Data ?? [],
-                StorageLimits.SearchableCharacters);
+            var rtf = items.FirstOrDefault(item => item.Type == "text/rtf")?.Data;
+            if (value is null && rtf is { Length: > 0 })
+            {
+                // RTF 解析预算跨条目共享；超限明确失败，不返回截断的粘贴内容。
+                if (rtf.Length > richTextBudget)
+                {
+                    throw new LibraryException(LibraryErrorCode.RichTextTooLarge);
+                }
+
+                richTextBudget -= rtf.Length;
+                value = TextExtraction.FromRtf(rtf, StorageLimits.SearchableCharacters);
+            }
+
             value ??= TextExtraction.FromHtml(
                 items.FirstOrDefault(item => item.Type == "text/html")?.Data ?? [],
                 StorageLimits.SearchableCharacters);
@@ -902,7 +1045,7 @@ public sealed class HistoryStore : IAsyncDisposable
             var filename = reader.GetString(2);
             var expected = reader.GetInt64(3);
             var path = AssetPath(filename);
-            if (path is null || !File.Exists(path) || new FileInfo(path).Length != expected)
+            if (path is null || !IsSafeAssetFile(path, expected))
             {
                 continue;
             }
@@ -924,7 +1067,8 @@ public sealed class HistoryStore : IAsyncDisposable
                 filePaths.AddRange(files);
                 if (imagePath is null && files.All(IsImagePath))
                 {
-                    imagePath = files.FirstOrDefault(IsUsableImageFile);
+                    // 只按扩展名选择候选；是否可读与解码由视图层在存储队列外限时完成。
+                    imagePath = files.FirstOrDefault();
                 }
 
                 if (!textItems.Contains(itemOrder))
@@ -1073,7 +1217,7 @@ public sealed class HistoryStore : IAsyncDisposable
             if (type == "image/png")
             {
                 var path = AssetPath(filename);
-                if (path is not null && File.Exists(path))
+                if (path is not null && IsSafeAssetFile(path))
                 {
                     return path;
                 }
@@ -1081,14 +1225,15 @@ public sealed class HistoryStore : IAsyncDisposable
             else if (type == "windows/file-list" && files is null)
             {
                 var path = AssetPath(filename);
-                if (path is not null && ReadFilePrefix(path, StorageLimits.MaximumRepresentationBytes) is { } data)
+                if (path is not null && IsSafeAssetFile(path) &&
+                    ReadFilePrefix(path, StorageLimits.MaximumRepresentationBytes) is { } data)
                 {
                     files = DecodeFileList(data);
                 }
             }
         }
 
-        return files?.All(IsImagePath) == true ? files.FirstOrDefault(IsUsableImageFile) : null;
+        return files?.All(IsImagePath) == true ? files.FirstOrDefault() : null;
     }
 
     private static byte[]? ReadFilePrefix(string path, int maximumBytes)
@@ -1152,34 +1297,52 @@ public sealed class HistoryStore : IAsyncDisposable
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".heic", ".heif", ".ico"
     };
 
-    private static bool IsImagePath(string path) =>
+    /// <summary>按扩展名判断文件引用是否能作为图片卡片展示，不访问磁盘。</summary>
+    public static bool IsImagePath(string path) =>
         ImageExtensions.Contains(Path.GetExtension(path));
 
-    /// <summary>仅接受本地固定卷上的普通图片文件，拒绝网络卷与未下载云文件。</summary>
-    private static bool IsUsableImageFile(string path)
+    /// <summary>目录 / 文件本身是符号链接、目录联接或其他重解析点时返回 true。</summary>
+    private static bool IsReparsePoint(string path)
     {
         try
         {
-            if (!Path.IsPathFullyQualified(path) || path.StartsWith(@"\\", StringComparison.Ordinal) ||
-                !File.Exists(path))
-            {
-                return false;
-            }
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return false;
+        }
+    }
 
-            var root = Path.GetPathRoot(path);
-            if (string.IsNullOrEmpty(root) || new DriveInfo(root).DriveType is not (DriveType.Fixed or DriveType.Ram))
-            {
-                return false;
-            }
-
+    /// <summary>
+    /// 存储资产必须是本目录内的普通文件：拒绝符号链接 / 重解析点、目录、
+    /// 离线占位文件以及大小不符的替换文件。
+    /// </summary>
+    private static bool IsSafeAssetFile(string path, long? expectedLength = null)
+    {
+        try
+        {
             var info = new FileInfo(path);
-            if (info.Length <= 0 || info.Length > StorageLimits.MaximumReferencedImageBytes ||
-                info.Attributes.HasFlag(FileAttributes.Offline))
+            if (!info.Exists)
             {
                 return false;
             }
 
-            return IsImagePath(path);
+            var attributes = info.Attributes;
+            if (attributes.HasFlag(FileAttributes.Directory) ||
+                attributes.HasFlag(FileAttributes.ReparsePoint) ||
+                attributes.HasFlag(FileAttributes.Offline))
+            {
+                return false;
+            }
+
+            // 普通资产应只有一个目录项；硬链接替换同样视为不可信。
+            if (!HasSingleLink(path))
+            {
+                return false;
+            }
+
+            return expectedLength is { } expected ? info.Length == expected : info.Length > 0;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -1295,6 +1458,48 @@ public sealed class HistoryStore : IAsyncDisposable
         value.Replace("\\", "\\\\", StringComparison.Ordinal)
             .Replace("%", "\\%", StringComparison.Ordinal)
             .Replace("_", "\\_", StringComparison.Ordinal);
+
+    /// <summary>通过句柄读取链接数，避免路径在检查后被替换成硬链接。</summary>
+    private static bool HasSingleLink(string path)
+    {
+        try
+        {
+            using var handle = File.OpenHandle(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            return GetFileInformationByHandle(handle, out var information) &&
+                   information.NumberOfLinks == 1;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle file,
+        out ByHandleFileInformation information);
 
     public async ValueTask DisposeAsync()
     {

@@ -80,7 +80,7 @@ public partial class QuickPanelWindow : Window
 
     public LibraryViewModel ViewModel => _vm;
 
-    public void ShowPanel()
+    public void ShowPanel(PasteTarget? preservedTarget = null)
     {
         if (_pasting)
         {
@@ -93,7 +93,7 @@ public partial class QuickPanelWindow : Window
             return;
         }
 
-        _pasteTarget = App.Services.Foreground.CaptureCurrentOrLast()?.ToTarget();
+        _pasteTarget = preservedTarget ?? App.Services.Foreground.CaptureCurrentOrLast()?.ToTarget();
         _vm.PanelOpened();
         Height = Math.Clamp(App.Services.Settings.PanelHeight, 420, 1000);
         var placement = ScreenPlacement.PlacePanel(this, Width, Height, App.Services.Tray?.GetIconRect());
@@ -154,20 +154,22 @@ public partial class QuickPanelWindow : Window
             if (!result.ClipboardWritten)
             {
                 _pasting = false;
+                var message = LibraryException.UserMessage(result.Error ?? LibraryErrorCode.Storage);
                 if (!IsVisible)
                 {
-                    ShowPanel();
+                    ReopenAfterPasteFailure(message);
                 }
 
-                _vm.SetFeedback(LibraryException.UserMessage(result.Error ?? LibraryErrorCode.Storage));
+                _vm.SetFeedback(message);
                 return;
             }
 
             if (result.Error is { } error)
             {
                 _pasting = false;
-                ShowPanel();
-                _vm.SetFeedback(LibraryException.UserMessage(error));
+                var message = LibraryException.UserMessage(error);
+                ReopenAfterPasteFailure(message);
+                _vm.SetFeedback(message);
             }
             else if (!result.PasteSent)
             {
@@ -178,6 +180,30 @@ public partial class QuickPanelWindow : Window
         {
             _pasting = false;
         }
+    }
+
+    /// <summary>
+    /// 失败后仅在原目标仍存活且前台仍是目标或本应用时重开列表；
+    /// 第三方应用已在前台时不抢焦点，只用不夺焦的气泡说明结果。
+    /// 重开沿用原目标并建立新的操作会话，不复用失败前的准备结果。
+    /// </summary>
+    private void ReopenAfterPasteFailure(string message)
+    {
+        if (IsVisible)
+        {
+            return;
+        }
+
+        var target = _pasteTarget;
+        if (target is not null &&
+            TargetPaster.IsTargetAlive(target) &&
+            TargetPaster.IsOwnOrTargetForeground(target))
+        {
+            ShowPanel(target);
+            return;
+        }
+
+        App.Services.Tray?.ShowBalloon("cvMaster", message);
     }
 
     public void SchedulePreviewShow(ClipCard card, ClipRow row)

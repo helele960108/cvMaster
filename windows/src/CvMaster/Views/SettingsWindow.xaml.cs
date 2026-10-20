@@ -120,7 +120,7 @@ public partial class SettingsWindow : Window
         App.Services.HotKeys.Suspend();
         HotKeyText.Text = "请按下组合键…";
         HotKeyText.Foreground = (Brush)FindResource("AccentBrush");
-        _vm.SetFeedback("按下包含 Ctrl / Alt / Shift / Win 的组合键，Esc 取消。");
+        _vm.SetFeedback("按下包含 Ctrl / Alt / Win 的组合键；仅 Ctrl 会与复制粘贴冲突。Esc 取消。");
         Focus();
     }
 
@@ -150,17 +150,18 @@ public partial class SettingsWindow : Window
             return;
         }
 
-        _recordingHotKey = false;
         if (_vm.TrySetHotKey(gesture, out var error))
         {
+            _recordingHotKey = false;
             _vm.SetFeedback($"快捷键已更新为 {_vm.ShortcutDisplay}");
-        }
-        else
-        {
-            _vm.SetFeedback(error ?? "快捷键注册失败。");
+            UpdateShortcutDisplay();
+            return;
         }
 
-        UpdateShortcutDisplay();
+        // 校验或注册失败时保留原快捷键并继续录制，用户可以直接重试。
+        _vm.SetFeedback(error ?? "快捷键注册失败。");
+        HotKeyText.Text = "请按下组合键…";
+        HotKeyText.Foreground = (Brush)FindResource("AccentBrush");
     }
 
     private void CancelHotKeyCapture()

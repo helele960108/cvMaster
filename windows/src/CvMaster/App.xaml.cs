@@ -59,7 +59,8 @@ public partial class App : Application
                     Services.Library.Paused = !Services.Library.Paused;
                     Services.Library.SetFeedback(Services.Library.Paused ? "剪贴板记录已暂停" : "剪贴板记录已恢复");
                 });
-            Services.Tray.UpdateTooltip($"cvMaster · {Services.Library.ShortcutDisplay}");
+            Services.Tray.UpdateTooltip(
+                $"cvMaster · {Services.Library.ShortcutDisplay}{(Services.Library.Paused ? " · 已暂停" : string.Empty)}");
             Services.StartMonitoring();
             _singleInstance.StartListener(Dispatcher, ShowPanel);
             SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;

@@ -14,7 +14,9 @@ public enum LibraryErrorCode
     UnavailableFile,
     NameConflict,
     PlainTextUnavailable,
-    PasteTargetUnavailable
+    RichTextTooLarge,
+    PasteTargetUnavailable,
+    PasteTargetNotReady
 }
 
 public sealed class LibraryException : Exception
@@ -42,7 +44,9 @@ public sealed class LibraryException : Exception
         LibraryErrorCode.UnavailableFile => "原文件已移动、删除或无权访问，无法复制文件引用。",
         LibraryErrorCode.NameConflict => "分组名称为空、过长或已存在。",
         LibraryErrorCode.PlainTextUnavailable => "此记录没有可用的纯文本或富文本表示，无法移除格式；原始剪贴板未改变。",
-        LibraryErrorCode.PasteTargetUnavailable => "未能恢复原输入窗口；内容已写入剪贴板，请手动按 Ctrl+V。",
+        LibraryErrorCode.RichTextTooLarge => "RTF 超过 256 KB 纯文本转换预算，未改变剪贴板；仍可使用普通粘贴保留原格式。",
+        LibraryErrorCode.PasteTargetNotReady => "未能激活目标应用；剪贴板未改变，请重新打开列表后重试。",
+        LibraryErrorCode.PasteTargetUnavailable => "未能向目标应用发送粘贴；内容已写入剪贴板，请手动按 Ctrl+V。",
         _ => "本地操作失败，请稍后重试。"
     };
 }

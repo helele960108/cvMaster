@@ -43,6 +43,28 @@ public sealed record HotKeyGesture(ModifierKeys Modifiers, Key Key)
         }
     }
 
+    /// <summary>
+    /// 至少包含 Ctrl、Alt 或 Win；仅 Ctrl 会与复制、粘贴等菜单快捷键冲突。
+    /// 与 macOS 端的快捷键校验规则保持一致。
+    /// </summary>
+    public string? ValidationMessage
+    {
+        get
+        {
+            if ((Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Windows)) == 0)
+            {
+                return "请至少包含 Ctrl、Alt 或 Win。";
+            }
+
+            if (Modifiers == ModifierKeys.Control)
+            {
+                return "仅使用 Ctrl 的组合会与复制、粘贴等快捷键冲突，请加入 Alt、Shift 或 Win。";
+            }
+
+            return null;
+        }
+    }
+
     public string Display
     {
         get
@@ -82,7 +104,8 @@ public sealed record HotKeyGesture(ModifierKeys Modifiers, Key Key)
         }
 
         var modifiers = Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Shift | ModifierKeys.Windows);
-        return modifiers == ModifierKeys.None ? null : new HotKeyGesture(modifiers, key);
+        // 组合是否合法由 ValidationMessage 判定，录制界面可以给出具体原因并继续等待。
+        return new HotKeyGesture(modifiers, key);
     }
 
     public static HotKeyGesture? Parse(string? value)
@@ -127,7 +150,8 @@ public sealed record HotKeyGesture(ModifierKeys Modifiers, Key Key)
             return null;
         }
 
-        return new HotKeyGesture(modifiers, key);
+        var gesture = new HotKeyGesture(modifiers, key);
+        return gesture.ValidationMessage is null ? gesture : null;
     }
 
     private static bool TryParseKey(string value, out Key key)

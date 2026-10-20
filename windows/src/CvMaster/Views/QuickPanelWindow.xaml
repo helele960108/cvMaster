@@ -328,13 +328,19 @@
                    Visibility="{Binding IsLoading, Converter={StaticResource BoolToVisibility}}" />
       </Grid>
 
-      <Button Grid.Row="6"
-              Margin="12,0,12,2"
-              HorizontalAlignment="Center"
-              Style="{StaticResource TextButtonStyle}"
-              Content="加载更多"
-              Visibility="{Binding HasMore, Converter={StaticResource BoolToVisibility}}"
-              Click="LoadMoreButton_Click" />
+      <StackPanel Grid.Row="6"
+                  Margin="12,0,12,2"
+                  HorizontalAlignment="Center">
+        <Button Style="{StaticResource TextButtonStyle}"
+                Content="加载更多"
+                Visibility="{Binding HasMore, Converter={StaticResource BoolToVisibility}}"
+                Click="LoadMoreButton_Click" />
+        <TextBlock Margin="0,4,0,4"
+                   FontSize="10"
+                   Foreground="{DynamicResource TextSecondaryBrush}"
+                   Text="已加载 300 条，请搜索缩小范围"
+                   Visibility="{Binding ShowMaximumLoadedHint, Converter={StaticResource BoolToVisibility}}" />
+      </StackPanel>
 
       <Border Grid.Row="7"
               BorderBrush="{DynamicResource BorderBrush}"

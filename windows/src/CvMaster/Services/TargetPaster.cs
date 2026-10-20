@@ -4,6 +4,7 @@
  * @author helele
  * @since 2026-10-19
  */
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using CvMaster.Interop;
 
@@ -12,24 +13,66 @@ namespace CvMaster.Services;
 public static class TargetPaster
 {
     private const int MediumIntegrity = 0x2000;
+    private static readonly TimeSpan PreparationDeadline = TimeSpan.FromMilliseconds(2500);
+    private static readonly TimeSpan StableDuration = TimeSpan.FromMilliseconds(100);
 
-    public static async Task<bool> TryPasteAsync(PasteTarget target, CancellationToken cancellationToken)
+    /// <summary>目标窗口仍存在、PID 未变且进程未退出。</summary>
+    public static bool IsTargetAlive(PasteTarget target)
     {
-        if (target.Handle == IntPtr.Zero ||
-            !NativeMethods.IsWindow(target.Handle) ||
-            NativeMethods.GetWindowThreadProcessId(target.Handle, out var processId) == 0 ||
-            processId != (uint)target.ProcessId ||
-            target.ProcessId == Environment.ProcessId)
+        if (!IsWindowForTarget(target))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(target.ProcessId);
+            return !process.HasExited;
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or NotSupportedException or System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>当前前台仍是目标窗口或本应用；第三方应用前台时不得抢焦点。</summary>
+    public static bool IsOwnOrTargetForeground(PasteTarget target)
+    {
+        var foreground = NativeMethods.GetForegroundWindow();
+        if (foreground == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        if (foreground == target.Handle)
+        {
+            return true;
+        }
+
+        NativeMethods.GetWindowThreadProcessId(foreground, out var processId);
+        return processId == (uint)Environment.ProcessId;
+    }
+
+    /// <summary>
+    /// 剪贴板写入前确认目标可接收：恢复窗口、等待实际前台、修饰键释放，
+    /// 并要求连续 100 ms 稳定。与 macOS 端的“当前激活应用”交接语义一致。
+    /// </summary>
+    public static async Task<bool> PrepareAsync(PasteTarget target, CancellationToken cancellationToken)
+    {
+        if (!IsWindowForTarget(target))
         {
             AppLog.Error("paste-target-invalid");
             return false;
         }
 
-        var currentLevel = GetIntegrityLevel(Environment.ProcessId) ?? MediumIntegrity;
-        var targetLevel = GetIntegrityLevel(target.ProcessId);
-        if (targetLevel is null || targetLevel > currentLevel)
+        if (!IsOwnOrTargetForeground(target))
         {
-            // 更高完整性级别或无法核验的目标可能静默丢弃 SendInput。
+            AppLog.Error("paste-target-not-frontmost");
+            return false;
+        }
+
+        if (!HasSufficientIntegrity(target))
+        {
             AppLog.Error("paste-target-integrity");
             return false;
         }
@@ -39,44 +82,68 @@ public static class TargetPaster
             NativeMethods.ShowWindowAsync(target.Handle, NativeMethods.SW_RESTORE);
         }
 
-        NativeMethods.SetForegroundWindow(target.Handle);
-        var foreground = false;
-        for (var attempt = 0; attempt < 40; attempt++)
+        var deadline = Stopwatch.StartNew();
+        var lastActivationRequest = TimeSpan.FromMilliseconds(-1000);
+        TimeSpan? stableSince = null;
+
+        while (deadline.Elapsed < PreparationDeadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (NativeMethods.GetForegroundWindow() == target.Handle)
+            var foreground = NativeMethods.GetForegroundWindow();
+            var ready = IsWindowForTarget(target) &&
+                        foreground == target.Handle &&
+                        !AnyModifierDown();
+            if (ready)
             {
-                foreground = true;
-                break;
+                stableSince ??= deadline.Elapsed;
+                if (deadline.Elapsed - stableSince.Value >= StableDuration)
+                {
+                    AppLog.Info("paste-target-ready");
+                    return true;
+                }
+            }
+            else
+            {
+                stableSince = null;
+                if (foreground != target.Handle)
+                {
+                    // 第三方应用取得前台时立即撤销请求，不把焦点强行抢回原目标。
+                    if (foreground != IntPtr.Zero)
+                    {
+                        NativeMethods.GetWindowThreadProcessId(foreground, out var foregroundProcess);
+                        if (foregroundProcess != (uint)Environment.ProcessId &&
+                            foregroundProcess != (uint)target.ProcessId)
+                        {
+                            AppLog.Error("paste-target-preempted");
+                            return false;
+                        }
+                    }
+
+                    if (deadline.Elapsed - lastActivationRequest >= TimeSpan.FromMilliseconds(250))
+                    {
+                        lastActivationRequest = deadline.Elapsed;
+                        NativeMethods.SetForegroundWindow(target.Handle);
+                    }
+                }
             }
 
             await Task.Delay(20, cancellationToken).ConfigureAwait(false);
         }
 
-        if (!foreground)
-        {
-            AppLog.Error("paste-foreground");
-            return false;
-        }
+        AppLog.Error("paste-preparation-deadline");
+        return false;
+    }
 
-        for (var attempt = 0; attempt < 40; attempt++)
-        {
-            if (!AnyModifierDown())
-            {
-                break;
-            }
+    /// <summary>写入剪贴板前的同步复核：目标仍是前台且没有修饰键按下。</summary>
+    public static bool IsReady(PasteTarget target) =>
+        IsWindowForTarget(target) &&
+        NativeMethods.GetForegroundWindow() == target.Handle &&
+        !AnyModifierDown();
 
-            if (attempt == 39)
-            {
-                AppLog.Error("paste-modifiers");
-                return false;
-            }
-
-            await Task.Delay(20, cancellationToken).ConfigureAwait(false);
-        }
-
-        if (!NativeMethods.IsWindow(target.Handle) ||
-            NativeMethods.GetForegroundWindow() != target.Handle)
+    /// <summary>写入剪贴板后、派发按键前同步复核；检查与派发之间不再 await。</summary>
+    public static bool Send(PasteTarget target)
+    {
+        if (!IsReady(target))
         {
             AppLog.Error("paste-target-lost");
             return false;
@@ -101,6 +168,28 @@ public static class TargetPaster
 
         AppLog.Info("paste-sent");
         return true;
+    }
+
+    private static bool IsWindowForTarget(PasteTarget target)
+    {
+        if (target.Handle == IntPtr.Zero ||
+            !NativeMethods.IsWindow(target.Handle) ||
+            NativeMethods.GetWindowThreadProcessId(target.Handle, out var processId) == 0 ||
+            processId != (uint)target.ProcessId ||
+            target.ProcessId == Environment.ProcessId)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>目标完整性级别高于当前进程时拒绝发送，避免静默丢弃或跨权限边界。</summary>
+    private static bool HasSufficientIntegrity(PasteTarget target)
+    {
+        var currentLevel = GetIntegrityLevel(Environment.ProcessId) ?? MediumIntegrity;
+        var targetLevel = GetIntegrityLevel(target.ProcessId);
+        return targetLevel is not null && targetLevel <= currentLevel;
     }
 
     private static NativeMethods.INPUT KeyInput(int virtualKey, bool keyUp) => new()

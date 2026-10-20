@@ -50,6 +50,31 @@ public sealed class ClipRow : INotifyPropertyChanged
             ClipKind.Image => "Icon.Image",
             _ => "Icon.File"
         }) as Geometry;
+
+        var parts = new List<string>(3);
+        if (clip.Pinned)
+        {
+            parts.Add("已置顶");
+        }
+
+        if (clip.Kind == ClipKind.Image)
+        {
+            parts.Add("图片");
+        }
+        else if (clip.Kind == ClipKind.File)
+        {
+            parts.Add($"文件：{clip.Title}");
+        }
+        else
+        {
+            var text = (string.IsNullOrWhiteSpace(clip.Excerpt) ? clip.Title : clip.Excerpt)
+                .Replace('\n', ' ')
+                .Replace('\r', ' ');
+            parts.Add($"{clip.Kind.DisplayName()}：{TextExtraction.Truncate(text, 120)}");
+        }
+
+        parts.Add($"来自{clip.Source}");
+        AccessibilityLabel = string.Join("，", parts);
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -83,6 +108,8 @@ public sealed class ClipRow : INotifyPropertyChanged
     public bool IsFile => Clip.Kind == ClipKind.File;
     public bool IsTextLike => Clip.Kind is ClipKind.Text or ClipKind.Link;
     public Geometry? KindIcon { get; }
+    /// <summary>整行合并语义，避免屏幕阅读器逐个子元素重复朗读。</summary>
+    public string AccessibilityLabel { get; }
 
     public void RefreshRelativeTime() => RelativeTime = FormatRelativeTime(Clip.CopiedAt);
 

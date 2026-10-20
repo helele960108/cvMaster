@@ -159,10 +159,37 @@ try
     var imagePreview = await store.GetPreviewAsync(imageClip.Id);
     Check("图片预览返回图片路径", imagePreview.ImagePath is not null && File.Exists(imagePreview.ImagePath));
 
+    var missingImage = Path.Combine(fixture, "不存在的图片.png");
+    await store.SaveAsync(
+        Capture(ClipKind.Image, "图片文件", new ClipRepresentation(0, "windows/file-list", HistoryStore.EncodeFileList([missingImage]))),
+        30);
+    var missingImageClip = (await PageAsync(store, kind: ClipKind.Image)).Clips
+        .First(clip => clip.HasFileReference);
+    var missingSource = await store.GetThumbnailSourceAsync(missingImageClip.Id);
+    Check("存储层不探测外部引用文件", missingSource == missingImage);
+
+    var bigRtf = Encoding.UTF8.GetBytes(@"{\rtf1 " + new string('a', 300_000) + "}");
+    await store.SaveAsync(
+        Capture(ClipKind.Text, "超预算 RTF", new ClipRepresentation(0, "text/rtf", bigRtf)),
+        30);
+    var bigRtfClip = (await PageAsync(store, "超预算")).Clips[0];
+    var richTextRejected = false;
+    try
+    {
+        await store.GetPlainTextAsync(bigRtfClip.Id, ClipKind.Text);
+    }
+    catch (LibraryException exception) when (exception.Code == LibraryErrorCode.RichTextTooLarge)
+    {
+        richTextRejected = true;
+    }
+
+    Check("超预算 RTF 纯文本转换明确拒绝", richTextRejected);
+
     var assetsBefore = Directory.GetFiles(store.AssetsDirectory).Length;
+    var imagesBeforeDelete = (await PageAsync(store, kind: ClipKind.Image)).Total;
     await store.DeleteAsync(imageClip.Id);
     Check("删除记录同时回收内容资产", Directory.GetFiles(store.AssetsDirectory).Length == assetsBefore - 1);
-    Check("删除后列表减少", (await PageAsync(store, kind: ClipKind.Image)).Total == 0);
+    Check("删除后列表减少", (await PageAsync(store, kind: ClipKind.Image)).Total == imagesBeforeDelete - 1);
 
     await store.SaveAsync(Capture(ClipKind.Text, "100% 完成", new ClipRepresentation(0, "text/plain", Text("100% 完成"))), 30);
     await store.SaveAsync(Capture(ClipKind.Text, "100 次", new ClipRepresentation(0, "text/plain", Text("100 次"))), 30);

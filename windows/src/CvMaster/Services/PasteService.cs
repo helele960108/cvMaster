@@ -1,6 +1,6 @@
 /**
- * 再次复制用例：后台读取表示、UI 线程写入剪贴板、恢复原窗口并定向粘贴。
- * 写入失败保留原剪贴板；粘贴失败会明确反馈而不伪造成功。
+ * 再次复制用例：先确认目标可接收，再写剪贴板并定向派发粘贴。
+ * 目标未准备好时保留原剪贴板；写入后发送失败只提示手动粘贴，不伪造成功。
  * @author helele
  * @since 2026-10-19
  */
@@ -45,6 +45,17 @@ public sealed class PasteService
 
         try
         {
+            if (_settings.AutoPaste)
+            {
+                // 粘贴请求必须在内容读取前绑定目标；第三方应用已在前台时不再抢焦点。
+                if (target is null ||
+                    !TargetPaster.IsTargetAlive(target) ||
+                    !TargetPaster.IsOwnOrTargetForeground(target))
+                {
+                    return new PasteResult(false, false, LibraryErrorCode.PasteTargetNotReady);
+                }
+            }
+
             IReadOnlyList<ClipRepresentation> representations;
             try
             {
@@ -57,16 +68,39 @@ public sealed class PasteService
                 return new PasteResult(false, false, exception.Code);
             }
 
+            var dispatcher = Application.Current.Dispatcher;
+            await dispatcher.InvokeAsync(hidePanel).Task.ConfigureAwait(false);
+
+            if (_settings.AutoPaste)
+            {
+                if (!await TargetPaster.PrepareAsync(target!, cancellationToken).ConfigureAwait(false))
+                {
+                    // 剪贴板此时尚未改动，用户可以直接重试。
+                    return new PasteResult(false, false, LibraryErrorCode.PasteTargetNotReady);
+                }
+            }
+
             uint sequence;
             _monitor.BeginSelfWrite();
             try
             {
-                var dispatcher = Application.Current.Dispatcher;
-                sequence = await dispatcher.InvokeAsync(() =>
+                var (ready, writtenSequence) = await dispatcher.InvokeAsync(() =>
                 {
-                    hidePanel();
-                    return ClipboardWriter.Write(representations);
+                    // 在真正写入剪贴板的同一 UI 回调里复核，缩小第三方应用抢占前后的时间窗。
+                    if (_settings.AutoPaste && !TargetPaster.IsReady(target!))
+                    {
+                        return (false, 0u);
+                    }
+
+                    return (true, ClipboardWriter.Write(representations));
                 }).Task.ConfigureAwait(false);
+                if (!ready)
+                {
+                    _monitor.EndSelfWrite(0);
+                    return new PasteResult(false, false, LibraryErrorCode.PasteTargetNotReady);
+                }
+
+                sequence = writtenSequence;
             }
             catch (LibraryException exception)
             {
@@ -83,16 +117,11 @@ public sealed class PasteService
             _monitor.EndSelfWrite(sequence);
 
             var pasteSent = false;
-            LibraryErrorCode? error = null;
-            if (_settings.AutoPaste && target is not null)
+            if (_settings.AutoPaste)
             {
                 try
                 {
-                    pasteSent = await TargetPaster.TryPasteAsync(target, cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
+                    pasteSent = TargetPaster.Send(target!);
                 }
                 catch (Exception exception)
                 {
@@ -102,7 +131,7 @@ public sealed class PasteService
 
                 if (!pasteSent)
                 {
-                    error = LibraryErrorCode.PasteTargetUnavailable;
+                    return new PasteResult(true, false, LibraryErrorCode.PasteTargetUnavailable);
                 }
             }
 
@@ -115,7 +144,7 @@ public sealed class PasteService
                 AppLog.Error("paste-mark", exception);
             }
 
-            return new PasteResult(true, pasteSent, error);
+            return new PasteResult(true, pasteSent, null);
         }
         finally
         {

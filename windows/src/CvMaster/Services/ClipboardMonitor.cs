@@ -12,6 +12,7 @@ using System.Windows.Interop;
 using System.Windows.Media.Imaging;
 using CvMaster.Core;
 using CvMaster.Interop;
+using Microsoft.Win32;
 
 namespace CvMaster.Services;
 
@@ -40,6 +41,7 @@ public sealed class ClipboardMonitor : IDisposable
     private uint _baselineSequence;
     private uint _suppressSequence;
     private uint _lastAcceptedSequence;
+    private long _baselineVersion;
     private int _busy;
     private int _selfWrite;
     private int _pendingRead;
@@ -95,7 +97,27 @@ public sealed class ClipboardMonitor : IDisposable
             AppLog.Error("clipboard-listener");
         }
 
+        // 锁屏 / 切换会话后只推进基线，恢复时不补采期间内容。
+        SystemEvents.SessionSwitch += OnSessionSwitch;
         ResetBaseline();
+    }
+
+    private void OnSessionSwitch(object sender, SessionSwitchEventArgs e) => ResetBaseline();
+
+    /// <summary>
+    /// 锁屏、UAC 或远程会话切换时输入桌面不可访问；此时不读取剪贴板。
+    /// Windows 没有 macOS 的 Secure Event Input，密码框保护依赖应用主动标记。
+    /// </summary>
+    private static bool IsCaptureBlocked()
+    {
+        var desktop = NativeMethods.OpenInputDesktop(0, false, NativeMethods.DESKTOP_READOBJECTS);
+        if (desktop == IntPtr.Zero)
+        {
+            return true;
+        }
+
+        NativeMethods.CloseDesktop(desktop);
+        return false;
     }
 
     /// <summary>应用主动写入或清空后抑制自身触发，并跳过当前序列。</summary>
@@ -105,6 +127,7 @@ public sealed class ClipboardMonitor : IDisposable
         {
             _suppressSequence = sequence;
             _baselineSequence = sequence;
+            _baselineVersion++;
         }
     }
 
@@ -123,6 +146,7 @@ public sealed class ClipboardMonitor : IDisposable
         {
             _baselineSequence = NativeMethods.GetClipboardSequenceNumber();
             _suppressSequence = 0;
+            _baselineVersion++;
         }
     }
 
@@ -146,6 +170,12 @@ public sealed class ClipboardMonitor : IDisposable
         }
 
         if (Volatile.Read(ref _selfWrite) == 1)
+        {
+            return;
+        }
+
+        // 安全桌面（锁屏 / UAC）或输入桌面不可用时保守跳过，不读取剪贴板内容。
+        if (IsCaptureBlocked())
         {
             return;
         }
@@ -226,7 +256,7 @@ public sealed class ClipboardMonitor : IDisposable
                 }
 
                 Thread.Sleep(attempt == 0 ? 60 : 40);
-                if (!_shouldRecord())
+                if (!_shouldRecord() || IsCaptureBlocked())
                 {
                     break;
                 }
@@ -242,6 +272,12 @@ public sealed class ClipboardMonitor : IDisposable
                 if (source is null)
                 {
                     break;
+                }
+
+                long baselineVersion;
+                lock (_sequenceGate)
+                {
+                    baselineVersion = _baselineVersion;
                 }
 
                 var sequence = NativeMethods.GetClipboardSequenceNumber();
@@ -261,6 +297,20 @@ public sealed class ClipboardMonitor : IDisposable
                     // 通知可能已被合并或过滤；主动标记，保证继续读取最终快照。
                     Interlocked.Exchange(ref _pendingRead, 1);
                     continue;
+                }
+
+                // 读取期间暂停、锁屏或被阻止时丢弃快照，基线已经推进，不补采。
+                lock (_sequenceGate)
+                {
+                    if (baselineVersion != _baselineVersion)
+                    {
+                        break;
+                    }
+                }
+
+                if (!_shouldRecord() || IsCaptureBlocked())
+                {
+                    break;
                 }
 
                 if (sequence != _lastAcceptedSequence)
@@ -406,52 +456,62 @@ public sealed class ClipboardMonitor : IDisposable
             var excerpt = TextExtraction.Truncate(searchText, StorageLimits.MaximumExcerptCharacters);
 
             var representations = new List<ClipRepresentation>();
+            var addedTypes = new HashSet<string>(StringComparer.Ordinal);
             long totalBytes = 0;
-            void AddRepresentation(string type, byte[] data)
+            // 必要表示超限时整条拒绝；可选富文本 / 像素超限时只跳过该表示，
+            // 与 macOS 采集策略一致，避免一个大 HTML 把可用的纯文本一起丢掉。
+            bool TryAdd(string type, byte[]? data, bool required)
             {
-                if (data.Length == 0)
+                if (data is null || data.Length == 0 || addedTypes.Contains(type))
                 {
-                    return;
+                    return false;
                 }
 
-                if (data.Length > StorageLimits.MaximumRepresentationBytes)
+                if (data.Length > StorageLimits.MaximumRepresentationBytes ||
+                    totalBytes + data.Length > StorageLimits.MaximumCaptureBytes ||
+                    representations.Count >= StorageLimits.MaximumRepresentations)
                 {
-                    throw new LibraryException(LibraryErrorCode.Unsupported);
+                    if (required)
+                    {
+                        throw new LibraryException(LibraryErrorCode.Unsupported);
+                    }
+
+                    return false;
                 }
 
                 totalBytes += data.Length;
-                if (totalBytes > StorageLimits.MaximumCaptureBytes ||
-                    representations.Count >= StorageLimits.MaximumRepresentations)
-                {
-                    throw new LibraryException(LibraryErrorCode.Unsupported);
-                }
-
+                addedTypes.Add(type);
                 representations.Add(new ClipRepresentation(0, type, data));
+                return true;
             }
 
             if (files.Length > 0)
             {
-                AddRepresentation("windows/file-list", HistoryStore.EncodeFileList(files));
+                // 文件引用是必要表示；不再同时保存文本，避免部分应用把粘贴结果当成路径文本。
+                TryAdd("windows/file-list", HistoryStore.EncodeFileList(files), required: true);
+                TryAdd("image/png", imagePng, required: false);
             }
-
-            if (!string.IsNullOrEmpty(text))
+            else if (!string.IsNullOrEmpty(text))
             {
-                AddRepresentation("text/plain", Encoding.UTF8.GetBytes(text));
+                TryAdd("text/plain", Encoding.UTF8.GetBytes(text), required: true);
+                TryAdd("image/png", imagePng, required: false);
+                TryAdd("text/rtf", rtf, required: false);
+                TryAdd("text/html", html, required: false);
             }
-
-            if (html is not null)
+            else if (imagePng is not null)
             {
-                AddRepresentation("text/html", html);
+                TryAdd("image/png", imagePng, required: true);
+                TryAdd("text/rtf", rtf, required: false);
+                TryAdd("text/html", html, required: false);
             }
-
-            if (rtf is not null)
+            else if (rtf is { Length: > 0 })
             {
-                AddRepresentation("text/rtf", rtf);
+                TryAdd("text/rtf", rtf, required: true);
+                TryAdd("text/html", html, required: false);
             }
-
-            if (imagePng is not null)
+            else
             {
-                AddRepresentation("image/png", imagePng);
+                TryAdd("text/html", html, required: true);
             }
 
             if (representations.Count == 0)
@@ -785,6 +845,7 @@ public sealed class ClipboardMonitor : IDisposable
         }
 
         _disposed = true;
+        SystemEvents.SessionSwitch -= OnSessionSwitch;
         if (_started)
         {
             NativeMethods.RemoveClipboardFormatListener(_source.Handle);

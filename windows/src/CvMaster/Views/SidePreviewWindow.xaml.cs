@@ -64,7 +64,7 @@ public partial class SidePreviewWindow : Window
             {
                 if (preview.ImagePath is { } path)
                 {
-                    var image = await ThumbnailService.LoadPreviewAsync(path, cancellationToken);
+                    var image = await App.Services.Thumbnails.LoadPreviewAsync(path, cancellationToken);
                     if (cancellationToken.IsCancellationRequested || _row != row)
                     {
                         return;

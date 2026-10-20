@@ -61,6 +61,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
         _theme = theme;
         _thumbnails = thumbnails;
         _hotKeys = hotKeys;
+        _paused = settings.Paused;
 
         _relativeTimeTimer = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
         _relativeTimeTimer.Tick += (_, _) => RefreshRelativeTimes();
@@ -125,6 +126,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
             OnPropertyChanged();
             OnPropertyChanged(nameof(StatusText));
             OnPropertyChanged(nameof(HasMore));
+            OnPropertyChanged(nameof(ShowMaximumLoadedHint));
         }
     }
 
@@ -141,6 +143,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
             _loadedCount = value;
             OnPropertyChanged();
             OnPropertyChanged(nameof(HasMore));
+            OnPropertyChanged(nameof(ShowMaximumLoadedHint));
             OnPropertyChanged(nameof(IsEmpty));
             OnPropertyChanged(nameof(IsEmptyVisible));
         }
@@ -175,11 +178,11 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
         KindFilter is not null ||
         TimeRange != ClipTimeRange.All;
 
-    public string EmptyTitle => HasActiveFilters ? "没有匹配的内容" : "这里还没有内容";
+    public string EmptyTitle => HasActiveFilters ? "没有找到内容" : "还没有内容";
 
-    public string EmptyDescription => HasActiveFilters
-        ? "换个分组、时间范围或关键词试试。"
-        : "复制内容后会自动出现在这里。";
+    public string EmptyDescription => "换个分组、时间范围或关键词试试。";
+
+    public bool ShowMaximumLoadedHint => !HasMore && LoadedCount >= StorageLimits.MaximumLoaded;
 
     public string Query
     {
@@ -334,6 +337,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
             }
 
             _paused = value;
+            _settings.Paused = value;
             Monitor?.ResetBaseline();
             OnPropertyChanged();
             OnPropertyChanged(nameof(PausedVisible));
@@ -515,6 +519,12 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
 
     public bool TrySetHotKey(HotKeyGesture gesture, out string? error)
     {
+        if (gesture.ValidationMessage is { } message)
+        {
+            error = message;
+            return false;
+        }
+
         var previous = _hotKeys.Current ?? HotKeyGesture.Default;
         if (_hotKeys.TryRegister(gesture))
         {
