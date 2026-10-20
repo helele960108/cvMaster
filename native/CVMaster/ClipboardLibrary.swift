@@ -43,6 +43,12 @@ final class ClipboardLibrary: ObservableObject {
 
     @Published var selection: UUID?
     @Published var shortcutAvailable = true
+    /// 当前全局快捷键；注册由应用代理执行，成功后才持久化。
+    @Published private(set) var globalShortcut = GlobalShortcut.load()
+    /// 最近一次录制失败或启动注册失败的原因。
+    @Published private(set) var shortcutConflict: String?
+    /// 应用代理注入：尝试注册新组合，返回冲突说明或 nil。
+    var applyGlobalShortcut: ((GlobalShortcut) -> String?)?
     /// 辅助功能权限状态；浮层引导与设置页共用，每次从系统实时读取。
     @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
     /// 系统授权提示每次应用运行最多触发一次，避免反复弹窗。
@@ -183,6 +189,49 @@ final class ClipboardLibrary: ObservableObject {
     /// 打开系统设置 → 通用 → 登录项，供待批准状态使用。
     func openLoginItemsSettings() {
         SMAppService.openSystemSettingsLoginItems()
+    }
+
+    /// 应用代理回写真实注册状态；启动注册失败或恢复失败时由代理调用。
+    func setShortcutRegistration(available: Bool, conflict: String?) {
+        shortcutAvailable = available
+        shortcutConflict = conflict
+    }
+
+    /// 先校验组合，再交由应用代理注册；失败保留原快捷键并显示原因。
+    @discardableResult
+    func updateGlobalShortcut(_ shortcut: GlobalShortcut) -> Bool {
+        if shortcut == globalShortcut, shortcutAvailable {
+            shortcutConflict = nil
+            return true
+        }
+        if let message = shortcut.validationMessage {
+            shortcutConflict = message
+            return false
+        }
+        guard let applyGlobalShortcut else {
+            shortcutConflict = "快捷键服务尚未就绪"
+            return false
+        }
+        if let error = applyGlobalShortcut(shortcut) {
+            shortcutConflict = error
+            return false
+        }
+        shortcutConflict = nil
+        shortcutAvailable = true
+        globalShortcut = shortcut
+        shortcut.save()
+        return true
+    }
+
+    /// 开始录制新组合时清除上一次的校验失败提示；注册服务本身不可用时保留原因。
+    func clearShortcutConflict() {
+        guard shortcutAvailable else { return }
+        shortcutConflict = nil
+    }
+
+    /// 恢复默认 ⌥Space；同样经过冲突检查。
+    func resetGlobalShortcut() {
+        updateGlobalShortcut(.defaultShortcut)
     }
 
     /// 设置页打开时刷新全库容量统计，不受当前搜索、分组或时间筛选影响。

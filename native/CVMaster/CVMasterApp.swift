@@ -51,6 +51,8 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private var lastExternalApplication: NSRunningApplication?
     /// 使用 Combine 自动注销工作区通知，不建立键盘监听。
     private var activationSubscription: AnyCancellable?
+    /// 快捷键变更后同步菜单栏提示，避免注册完成前后读到旧组合。
+    private var shortcutSubscription: AnyCancellable?
     /// 仅记录粘贴阶段与错误码，不记录输入框内容、剪贴板内容或文件名。
     private let pasteLogger = Logger(subsystem: "local.helele.cvmaster", category: "paste")
 
@@ -74,7 +76,7 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
                 button.image = NSImage(systemSymbolName: "clipboard", accessibilityDescription: "cvMaster 剪贴板")
                 button.image?.isTemplate = true
             }
-            button.toolTip = "cvMaster · ⌥Space"
+            button.toolTip = "cvMaster · \(library.globalShortcut.display)"
             button.target = self
             button.action = #selector(togglePopover)
         }
@@ -130,7 +132,14 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         appearanceSubscription = library.$appearance.sink { [weak self] appearance in
             self?.applyAppearance(appearance)
         }
-        registerShortcut()
+        library.applyGlobalShortcut = { [weak self] shortcut in
+            guard let self else { return "快捷键服务不可用" }
+            return self.changeGlobalShortcut(shortcut)
+        }
+        shortcutSubscription = library.$globalShortcut
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusItemTooltip() }
+        if installShortcutHandler() { registerInitialShortcut() }
     }
 
     /// 同步应用、独立浮层及宿主视图；nil 同时清除各层覆盖，恢复系统外观继承。
@@ -344,22 +353,84 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         throw LibraryError.pasteTargetUnavailable
     }
 
-    /// 注册单一系统热键，不申请辅助功能权限；冲突时保留图标入口并提示。
-    private func registerShortcut() {
+    /// 安装一次热键事件处理；之后只更换注册组合，不重复安装 handler。
+    @discardableResult
+    private func installShortcutHandler() -> Bool {
         var type = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let installed = InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
             Task { @MainActor in StatusAppDelegate.current?.togglePopover() }
             return noErr
         }, 1, &type, nil, &eventHandler)
         guard installed == noErr else {
-            library.shortcutAvailable = false
+            library.setShortcutRegistration(available: false, conflict: "快捷键服务不可用，请点击菜单栏图标")
+            updateStatusItemTooltip()
+            return false
+        }
+        return true
+    }
+
+    /// 注册持久化的快捷键；系统占用或注册失败时保留图标入口并说明原因。
+    private func registerInitialShortcut() {
+        let shortcut = library.globalShortcut
+        if let message = shortcut.validationMessage {
+            library.setShortcutRegistration(available: false, conflict: message)
+            updateStatusItemTooltip()
             return
         }
+        if let conflict = GlobalShortcut.systemConflict(for: shortcut) {
+            library.setShortcutRegistration(available: false, conflict: conflict)
+            updateStatusItemTooltip()
+            return
+        }
+        let status = registerHotKey(shortcut)
+        library.setShortcutRegistration(available: status == noErr,
+                                        conflict: status == noErr ? nil : hotKeyError(status))
+        updateStatusItemTooltip()
+    }
+
+    /// 设置页更换快捷键：先检查系统组合，再替换注册；失败时恢复旧组合。
+    private func changeGlobalShortcut(_ shortcut: GlobalShortcut) -> String? {
+        guard eventHandler != nil else { return "快捷键服务不可用，请重启应用" }
+        if let message = shortcut.validationMessage { return message }
+        if let conflict = GlobalShortcut.systemConflict(for: shortcut) { return conflict }
+        let previous = library.globalShortcut
+        let status = registerHotKey(shortcut)
+        if status == noErr { return nil }
+        let restore = registerHotKey(previous)
+        let message = hotKeyError(status)
+        library.setShortcutRegistration(available: restore == noErr,
+                                        conflict: restore == noErr ? message : "\(message)；原快捷键也未恢复，请重新设置")
+        updateStatusItemTooltip()
+        return restore == noErr ? message : "\(message)；原快捷键也未恢复，请重新设置"
+    }
+
+    /// 先注销旧组合再注册新组合；成功时保存新的 Carbon 引用。
+    private func registerHotKey(_ shortcut: GlobalShortcut) -> OSStatus {
+        unregisterHotKey()
+        var reference: EventHotKeyRef?
         let identifier = EventHotKeyID(signature: 0x43564D53, id: 1)
-        let registered = RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), identifier,
-                                             GetApplicationEventTarget(), 0, &hotKey)
-        library.shortcutAvailable = registered == noErr
-        if registered != noErr { statusItem?.button?.toolTip = "cvMaster · 快捷键不可用，请点击图标" }
+        let status = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, identifier,
+                                         GetApplicationEventTarget(), 0, &reference)
+        if status == noErr { hotKey = reference }
+        return status
+    }
+
+    private func unregisterHotKey() {
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        hotKey = nil
+    }
+
+    private func hotKeyError(_ status: OSStatus) -> String {
+        status == eventHotKeyExistsErr
+            ? "该组合已被其他应用占用，请换一个组合"
+            : "无法注册该快捷键（错误 \(status)）"
+    }
+
+    /// 菜单栏提示跟随当前组合与注册状态，不永久显示默认键。
+    private func updateStatusItemTooltip() {
+        statusItem?.button?.toolTip = library.shortcutAvailable
+            ? "cvMaster · \(library.globalShortcut.display)"
+            : "cvMaster · 快捷键不可用，请点击图标"
     }
 
     func popoverDidClose(_ notification: Notification) { library.panelClosed() }
@@ -372,7 +443,7 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
 
     func applicationWillTerminate(_ notification: Notification) {
         library.monitor?.stop()
-        if let hotKey { UnregisterEventHotKey(hotKey) }
+        unregisterHotKey()
         if let eventHandler { RemoveEventHandler(eventHandler) }
         Self.current = nil
     }

@@ -451,8 +451,11 @@ struct QuickPanelView: View {
                 } else {
                     Text("\(library.total) 条 · 本地保存").foregroundStyle(.secondary)
                     Spacer()
-                    Text(library.shortcutAvailable ? "⌥Space" : "热键不可用")
+                    Text(library.shortcutAvailable ? library.globalShortcut.display : "热键不可用")
                         .foregroundStyle(library.shortcutAvailable ? Color.secondary : .orange)
+                        .lineLimit(1)
+                        .help(library.shortcutAvailable ? "全局快捷键：\(library.globalShortcut.display)"
+                                                        : "全局快捷键不可用，请在设置中重新录制")
                         .help("↑↓ 选择，回车或双击粘贴；Esc 收起")
                 }
             }.font(.caption2).padding(.horizontal, 18).padding(.vertical, 11)
