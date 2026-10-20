@@ -27,6 +27,8 @@ struct QuickPanelView: View {
     @ViewState<Bool> private var deleting = false
     /// 拖动期间暂停侧边预览，避免浮层重新锚定干扰连续调整。
     @ViewState<Bool> private var resizing = false
+    /// 权限横幅仅在本次应用运行内可稍后关闭，下次启动仍会提示。
+    @ViewState<Bool> private var permissionBannerDismissed = false
     /// 搜索焦点，在每次浮层显示时恢复。
     @FocusState private var focused: Bool
     /// 系统设置入口只从次级菜单触发。
@@ -37,6 +39,7 @@ struct QuickPanelView: View {
             header
             search
             filters
+            if showsPermissionBanner { permissionBanner }
             Divider().padding(.horizontal, 14)
             if !library.recordingEnabled {
                 VStack(alignment: .leading, spacing: 9) {
@@ -60,6 +63,10 @@ struct QuickPanelView: View {
         .onChange(of: library.scope) { dismissPreview() }
         .onChange(of: library.kind) { dismissPreview() }
         .onChange(of: library.timeRange) { dismissPreview() }
+        .onChange(of: library.accessibilityGranted) {
+            // 重新授权后复位，未来若再次撤销权限仍会显示引导。
+            if library.accessibilityGranted { permissionBannerDismissed = false }
+        }
         .onChange(of: library.clips.map(\.id)) { dismissPreview() }
         .onChange(of: editingGroup) { if editingGroup { dismissPreview() } }
         .onChange(of: deleting) { if deleting { dismissPreview() } }
@@ -157,6 +164,54 @@ struct QuickPanelView: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel("内容类型筛选")
         }.padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 6)
+    }
+
+    /// 仅在已开启记录且缺少辅助功能权限时提示；关闭记录时由记录引导优先。
+    private var showsPermissionBanner: Bool {
+        library.recordingEnabled && !library.accessibilityGranted && !permissionBannerDismissed
+    }
+
+    /// 情境式权限引导：说明用途、直达系统设置，并允许本次运行内稍后处理。
+    private var permissionBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "hand.raised.fill")
+                .font(.caption)
+                .foregroundStyle(ClipboardLibrary.accent)
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("自动粘贴需要辅助功能权限")
+                    .font(.caption.weight(.semibold))
+                Text("授权后，回车或双击可直接粘贴到原输入位置。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+            Spacer(minLength: 4)
+            Button("去开启") { library.openAccessibilitySettings() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .help("打开系统设置 → 隐私与安全性 → 辅助功能")
+            Button { permissionBannerDismissed = true } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("稍后")
+            .help("本次使用期间不再提示")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(ClipboardLibrary.accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(ClipboardLibrary.accent.opacity(0.25), lineWidth: 1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
     }
 
     /// 原生菜单覆盖展示，不改变列表高度；固定命中区域与清除搜索按钮互不重叠。

@@ -188,7 +188,7 @@ enum LibraryError: LocalizedError {
     case pastePermissionRequired, pasteTargetUnavailable
     var errorDescription: String? {
         switch self {
-        case .pastePermissionRequired: "当前版本尚未获得辅助功能权限。若开关已开，请移除旧 cvMaster 条目，再添加 ~/Applications/cvMaster.app 并开启权限；重启应用后重新聚焦输入框再试。剪贴板未改变。"
+        case .pastePermissionRequired: "尚未获得辅助功能权限。请在“系统设置 → 隐私与安全性 → 辅助功能”中开启 cvMaster；若已开启仍无效，请移除旧条目后重新添加 ~/Applications/cvMaster.app。剪贴板未改变。"
         case .pasteTargetUnavailable: "未能向原输入位置发送粘贴，请聚焦可编辑输入框后重新打开列表；若剪贴板已更新，可手动按 ⌘V。"
         case .storage: "本地存储不可用，请检查磁盘空间或重新打开应用。"
         case .capacity: "存储已达上限，请清理记录；置顶和已分组内容不会被自动删除。"

@@ -22,8 +22,33 @@ struct PreferencesView: View {
         TabView {
             Tab("通用", systemImage: "gearshape") {
                 Form {
-                    Section {
+                    Section("启动") {
+                        Toggle("登录时启动", isOn: Binding(
+                            get: { library.launchAtLogin },
+                            set: { library.setLaunchAtLogin($0) }
+                        ))
+                        if library.launchAtLoginRequiresApproval {
+                            HStack(spacing: 8) {
+                                Label("等待系统允许", systemImage: "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(.orange)
+                                Spacer()
+                                Button("打开登录项设置") { library.openLoginItemsSettings() }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                            }
+                        }
+                        Text("登录 Mac 后自动在菜单栏待命，不显示 Dock 图标。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Section("权限") {
                         Toggle("允许记录剪贴板", isOn: $library.recordingEnabled)
+                        accessibilityPermission
+                        if !library.accessibilityGranted {
+                            Text("授权后仍无效？请在系统设置中移除旧 cvMaster 条目，再重新添加 ~/Applications/cvMaster.app。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Section {
                         LabeledContent("唤起列表", value: library.shortcutAvailable ? "⌥ Space · 全局" : "快捷键不可用，请点击菜单栏图标")
                         Picker("外观", selection: $library.appearance) {
                             ForEach(AppAppearance.allCases) { appearance in
@@ -37,7 +62,14 @@ struct PreferencesView: View {
                         Text("只保留菜单栏图标。选择记录后收起并粘贴到原输入位置，需辅助功能授权；关闭记录后不会追溯保存当前剪贴板。")
                             .font(.callout).foregroundStyle(.secondary)
                     }
+                    if let feedback = library.feedback {
+                        Text(feedback).font(.caption).foregroundStyle(ClipboardLibrary.accent)
+                    }
                 }.formStyle(.grouped)
+                .onAppear {
+                    library.refreshAccessibilityStatus()
+                    library.refreshLaunchAtLoginStatus()
+                }
             }
             Tab("记录与隐私", systemImage: "hand.raised") {
                 RecordsPrivacySettings(library: library)
@@ -109,6 +141,37 @@ struct PreferencesView: View {
             } else {
                 let message = "将永久删除全部历史记录，包含置顶与分组内容；保留分组结构，不删除引用的原文件。"
                 Text(message).accessibilityLabel(message)
+            }
+        }
+    }
+
+    /// 辅助功能状态与入口；授权后由应用激活自动刷新，也可手动重新检测。
+    private var accessibilityPermission: some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("辅助功能")
+                Text("用于恢复原输入位置并发送 ⌘V，不读取输入内容")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 6) {
+                Text(library.accessibilityGranted ? "已授权" : "未授权")
+                    .font(.callout)
+                    .foregroundStyle(library.accessibilityGranted ? Color.green : ClipboardLibrary.accent)
+                    .accessibilityLabel("辅助功能权限")
+                    .accessibilityValue(library.accessibilityGranted ? "已授权" : "未授权")
+                if !library.accessibilityGranted {
+                    HStack(spacing: 6) {
+                        Button("去开启") { library.openAccessibilitySettings() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .help("打开系统设置 → 隐私与安全性 → 辅助功能")
+                        Button("重新检测") { library.refreshAccessibilityStatus() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("从系统设置返回后会自动检测")
+                    }
+                }
             }
         }
     }

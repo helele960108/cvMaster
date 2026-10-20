@@ -47,8 +47,6 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private var pasteElement: AXUIElement?
     /// 即使目标延迟暴露输入节点，也必须在原窗口中重试，禁止回退到其他窗口。
     private var pasteWindow: AXUIElement?
-    /// 当前进程仅首次缺少权限时请求系统提示，后续点击只显示应用内说明，避免反复弹窗。
-    private var requestedAccessibilityPermission = false
     /// 菜单栏点击可能先激活本应用，保留最近的外部应用作为原输入位置的候选。
     private var lastExternalApplication: NSRunningApplication?
     /// 使用 Combine 自动注销工作区通知，不建立键盘监听。
@@ -168,6 +166,8 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     @objc func togglePopover() {
         // 粘贴交接期间不能重新唤起搜索框，避免目标应用恢复前再次抢走键盘焦点。
         guard !library.copying, let button = statusItem?.button else { return }
+        // 从系统设置返回或授权状态变化后，下次打开浮层立即使用最新状态。
+        library.refreshAccessibilityStatus()
         if popover.isShown { popover.performClose(nil); return }
         capturePasteTarget()
         library.resizePanel(to: library.panelHeight)
@@ -252,15 +252,11 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         return editable
     }
 
-    /// 在改写剪贴板之前无提示地检查权限；每次启动最多请求一次系统授权提示。
+    /// 在改写剪贴板之前检查权限；首次缺少权限时由共享状态触发一次系统提示。
     /// 不缓存授权结果，用户在系统设置授权后，下次操作立即重新检查真实状态。
     private func validatePasteTarget() throws {
         guard AXIsProcessTrusted() else {
-            if !requestedAccessibilityPermission {
-                requestedAccessibilityPermission = true
-                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-                _ = AXIsProcessTrustedWithOptions(options)
-            }
+            library.promptForAccessibilityIfNeeded()
             pasteLogger.error("Paste rejected: accessibility permission missing for current signed build")
             throw LibraryError.pastePermissionRequired
         }
@@ -367,6 +363,12 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     }
 
     func popoverDidClose(_ notification: Notification) { library.panelClosed() }
+
+    /// 从系统设置返回或其他方式重新激活应用时，刷新辅助功能与登录项状态。
+    func applicationDidBecomeActive(_ notification: Notification) {
+        library.refreshAccessibilityStatus()
+        library.refreshLaunchAtLoginStatus()
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         library.monitor?.stop()
