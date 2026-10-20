@@ -8,96 +8,171 @@ import Foundation
 import AppKit
 import SQLite3
 import CryptoKit
-import ImageIO
-import UniformTypeIdentifiers
 import OSLog
+import Darwin
+import Dispatch
 
 /// 只允许预定义绑定类型，不拼接用户提供的 SQL。
 private enum SQLValue {
     case text(String), integer(Int), real(Double)
 }
 
-/// 缩略图来源：内置资产可直接解码，外部引用必须离开串行存储 actor 再读取。
-private enum ThumbnailSource: Sendable {
-    case stored(URL), referenced(URL)
-}
-
-/// 超时与正常失败分开，只有超时文件才在同一进程内跳过，避免反复创建阻塞读取。
-private enum ThumbnailOutcome: Sendable {
-    case finished(Data?), timedOut
-}
-
-/// 异常挂载点上的文件可能让系统调用永久阻塞；记录后本次运行不再重试同一资产。
-private final class TimedOutThumbnailCache: @unchecked Sendable {
-    static let shared = TimedOutThumbnailCache()
+/// 外部文件可读性也可能被异常挂载点阻塞；仅两个实际工作槽，无排队替代线程。
+/// 三秒仅限制调用者等待，取消 / 超时不会释放仍在系统调用中的槽。
+private final class FileAvailability: @unchecked Sendable {
+    static let shared = FileAvailability()
     private let lock = NSLock()
-    private var paths: Set<String> = []
+    private var active = 0
+    private let workers = DispatchQueue(label: "local.helele.cvmaster.availability", qos: .utility, attributes: .concurrent)
+    private let deadlines = DispatchQueue(label: "local.helele.cvmaster.availability.deadlines", qos: .utility)
 
-    func contains(_ path: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return paths.contains(path)
+    private final class Waiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Bool, Never>?
+        private var timer: DispatchSourceTimer?
+        private var finished = false
+
+        func install(_ continuation: CheckedContinuation<Bool, Never>) -> Bool {
+            let installed = lock.withLock {
+                guard !finished else { return false }
+                self.continuation = continuation
+                return true
+            }
+            if !installed { continuation.resume(returning: false) }
+            return installed
+        }
+
+        func startDeadline(on queue: DispatchQueue) {
+            let source = DispatchSource.makeTimerSource(queue: queue)
+            source.schedule(deadline: .now() + 3)
+            source.setEventHandler { [weak self] in self?.finish(false) }
+            lock.withLock {
+                source.resume()
+                if finished { source.setEventHandler(handler: nil); source.cancel() }
+                else { timer = source }
+            }
+        }
+
+        func finish(_ value: Bool) {
+            let result = lock.withLock { () -> (CheckedContinuation<Bool, Never>?, DispatchSourceTimer?) in
+                guard !finished else { return (nil, nil) }
+                finished = true
+                let result = (continuation, timer)
+                continuation = nil
+                timer = nil
+                return result
+            }
+            result.1?.setEventHandler(handler: nil)
+            result.1?.cancel()
+            result.0?.resume(returning: value)
+        }
     }
 
-    func insert(_ path: String) {
-        lock.lock(); paths.insert(path); lock.unlock()
-    }
-}
-
-/// 只允许第一个结果恢复等待者；卡死任务稍后完成时不会再次恢复。
-private final class ThumbnailRace: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<ThumbnailOutcome, Never>?
-
-    init(_ continuation: CheckedContinuation<ThumbnailOutcome, Never>) {
-        self.continuation = continuation
-    }
-
-    func finish(_ outcome: ThumbnailOutcome) {
-        lock.lock()
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        continuation?.resume(returning: outcome)
+    func check(_ urls: [URL]) async -> Bool {
+        guard !Task.isCancelled, urls.count <= StorageLimits.maximumRepresentations else { return false }
+        guard !urls.isEmpty else { return true }
+        // 这里只检查纯 URL 属性，不在存储 actor 内查询外部卷或解析符号链接。
+        guard urls.allSatisfy({ $0.isFileURL && ($0.host == nil || $0.host == "" || $0.host == "localhost")
+            && !$0.path.utf8.contains(0) }) else { return false }
+        let waiter = Waiter()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard waiter.install(continuation) else { return }
+                let admitted = lock.withLock {
+                    guard active < 2 else { return false }
+                    active += 1
+                    return true
+                }
+                guard admitted else { waiter.finish(false); return }
+                waiter.startDeadline(on: deadlines)
+                workers.async { [self] in
+                    defer { lock.withLock { active -= 1 } }
+                    // 不调用下载 API；元数据 / access 本身仍可能触发 OS 文件系统行为。
+                    let readable = urls.allSatisfy { url in
+                        guard let info = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
+                              info.isUbiquitousItem != true || info.ubiquitousItemDownloadingStatus == .current
+                                || info.ubiquitousItemDownloadingStatus == .downloaded else { return false }
+                        return FileManager.default.isReadableFile(atPath: url.path)
+                    }
+                    waiter.finish(readable)
+                }
+            }
+        } onCancel: {
+            waiter.finish(false)
+        }
     }
 }
 
 actor HistoryStore {
     /// 数据库连接仅由本 actor 访问，避免并发共享 SQLite 指针。
     private var database: OpaquePointer?
-    /// 应用独占数据目录；nil 表示尚未成功初始化，不自动切换临时存储。
     private var root: URL?
-    /// 元数据日志不记录正文、路径或 SQL 参数。
+    private var rootDescriptor: Int32 = -1
+    private var assetsDescriptor: Int32 = -1
+    private let directoryOverride: URL?
+    private let enablesTrigram: Bool
+    private var hasTrigram = false
+    private var cachedStats: StorageStats?
     private let logger = Logger(subsystem: "local.helele.cvmaster", category: "storage")
-    /// SQLite 对绑定字符串进行复制，避免 Swift 临时缓冲区生命周期问题。
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    /// 首次初始化后复用一个连接；禁用同步联网、自动建种子或隐式覆盖旧库。
+    /// 可注入独立目录并关闭可选索引，供隔离回归测试；默认仍只使用应用目录。
+    init(directory: URL? = nil, enablesTrigram: Bool = true) {
+        directoryOverride = directory
+        self.enablesTrigram = enablesTrigram
+    }
+
+    isolated deinit {
+        sqlite3_close(database)
+        if assetsDescriptor >= 0 { Darwin.close(assetsDescriptor) }
+        if rootDescriptor >= 0 { Darwin.close(rootDescriptor) }
+    }
+
+    /// 首次初始化后复用连接；不回退到临时库，不跟随应用目录、数据库或边车符号链接。
     func prepare() throws {
-        guard database == nil else { return }
-        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                                    appropriateFor: nil, create: true).appendingPathComponent("cvMaster", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
-        let assets = directory.appendingPathComponent("assets", isDirectory: true)
-        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
-        var connection: OpaquePointer?
-        let file = directory.appendingPathComponent("history.sqlite")
-        guard sqlite3_open_v2(file.path, &connection, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
-            sqlite3_close(connection)
-            throw LibraryError.storage
+        if database != nil {
+            try verifyDirectories()
+            try secureDatabaseFile("history.sqlite")
+            try hardenSidecars()
+            return
         }
-        database = connection
-        root = directory
         do {
+            let directory: URL
+            if let directoryOverride {
+                guard directoryOverride.isFileURL else { throw LibraryError.storage }
+                directory = directoryOverride
+            } else {
+                directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                    appropriateFor: nil, create: true).appendingPathComponent("cvMaster", isDirectory: true)
+            }
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            rootDescriptor = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            try secureDirectory(rootDescriptor)
+            if mkdirat(rootDescriptor, "assets", 0o700) != 0, errno != EEXIST { throw LibraryError.storage }
+            assetsDescriptor = openat(rootDescriptor, "assets", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            try secureDirectory(assetsDescriptor)
+            // 在 SQLite 打开前创建 0600 普通文件，避免先暴露内容再 chmod 的时间窗口。
+            try secureDatabaseFile("history.sqlite", create: true)
+            try hardenSidecars()
+            let file = directory.appendingPathComponent("history.sqlite")
+            var connection: OpaquePointer?
+            let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_NOFOLLOW
+            guard sqlite3_open_v2(file.path, &connection, flags, nil) == SQLITE_OK else {
+                sqlite3_close(connection)
+                throw LibraryError.storage
+            }
+            database = connection
+            root = directory
             sqlite3_busy_timeout(connection, 1500)
             try execute("PRAGMA foreign_keys=ON")
             try execute("PRAGMA journal_mode=WAL")
+            try hardenSidecars()
             try execute("PRAGMA synchronous=NORMAL")
             try execute("PRAGMA cache_size=-2048")
             try execute("PRAGMA journal_size_limit=4194304")
             let version = try scalar("PRAGMA user_version")
-            guard version <= 3 else { throw LibraryError.storage }
+            guard version <= 4 else { throw LibraryError.storage }
             try execute("""
                 CREATE TABLE IF NOT EXISTS entry(
                     id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
@@ -116,113 +191,226 @@ actor HistoryStore {
                     id TEXT PRIMARY KEY,entry_id TEXT NOT NULL REFERENCES entry(id) ON DELETE CASCADE,
                     item_order INTEGER NOT NULL,uti TEXT NOT NULL,filename TEXT NOT NULL UNIQUE,byte_size INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS representation_entry ON representation(entry_id,item_order);
+                CREATE TABLE IF NOT EXISTS search_meta(id INTEGER PRIMARY KEY CHECK(id=1),dirty INTEGER NOT NULL);
+                INSERT OR IGNORE INTO search_meta(id,dirty) VALUES(1,1);
                 """)
-            // v1 记录保留，空标识使用通用图标；迁移与版本号更新一起提交。
-            if version < 2 {
-                do {
-                    try execute("BEGIN IMMEDIATE")
+            try transaction {
+                if version < 2 {
                     try execute("ALTER TABLE entry ADD COLUMN source_bundle_id TEXT NOT NULL DEFAULT ''")
-                    try execute("PRAGMA user_version=2")
-                    try execute("COMMIT")
-                } catch {
-                    try? execute("ROLLBACK")
-                    throw error
                 }
-            }
-            // 旧文件记录只更新可见分类，不触碰资产、分组、置顶或复制表示。
-            if version < 3 {
-                do {
-                    try execute("BEGIN IMMEDIATE")
-                    try reclassifyImageFiles()
-                    try execute("PRAGMA user_version=3")
-                    try execute("COMMIT")
-                } catch {
-                    try? execute("ROLLBACK")
-                    throw error
+                if version < 3 { try reclassifyImageFiles() }
+                if version < 4 {
+                    // 显示文案不再是持久化键；未知类型保留原值，读取时安全回退为文本。
+                    for kind in ClipKind.allCases {
+                        try execute("UPDATE entry SET kind=? WHERE kind=?", [.text(kind.storageValue), .text(kind.rawValue)])
+                    }
                 }
+                try execute("PRAGMA user_version=4")
             }
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            try configureSearch()
             try recoverAssets()
-            logger.info("Local storage ready; schema version 3")
+            logger.info("Local storage ready; schema version 4")
         } catch {
             sqlite3_close(database)
             database = nil
             root = nil
+            hasTrigram = false
+            if assetsDescriptor >= 0 { Darwin.close(assetsDescriptor); assetsDescriptor = -1 }
+            if rootDescriptor >= 0 { Darwin.close(rootDescriptor); rootDescriptor = -1 }
             logger.error("Local storage initialization failed")
             throw LibraryError.storage
         }
     }
 
-    /// 仅扫描轻量文件名元数据，不读取原文件；不完整的多文件摘要保守保持文件分类。
+    private func secureDirectory(_ descriptor: Int32) throws {
+        var info = stat()
+        guard descriptor >= 0, fstat(descriptor, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == getuid(),
+              fchmod(descriptor, 0o700) == 0 else { throw LibraryError.storage }
+    }
+
+    /// 拒绝准备后 root/assets 被替换为其他 inode；资产 I/O 仍相对已打开描述符执行。
+    private func verifyDirectories() throws {
+        guard let root else { throw LibraryError.storage }
+        var openedRoot = stat(), pathRoot = stat(), openedAssets = stat(), pathAssets = stat()
+        guard fstat(rootDescriptor, &openedRoot) == 0, lstat(root.path, &pathRoot) == 0,
+              (pathRoot.st_mode & S_IFMT) == S_IFDIR,
+              openedRoot.st_dev == pathRoot.st_dev, openedRoot.st_ino == pathRoot.st_ino,
+              fstat(assetsDescriptor, &openedAssets) == 0,
+              fstatat(rootDescriptor, "assets", &pathAssets, AT_SYMLINK_NOFOLLOW) == 0,
+              (pathAssets.st_mode & S_IFMT) == S_IFDIR,
+              openedAssets.st_dev == pathAssets.st_dev, openedAssets.st_ino == pathAssets.st_ino else {
+            throw LibraryError.storage
+        }
+        try secureDirectory(rootDescriptor)
+        try secureDirectory(assetsDescriptor)
+    }
+
+    private func secureDatabaseFile(_ name: String, create: Bool = false) throws {
+        let descriptor = openat(rootDescriptor, name, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | (create ? O_CREAT : 0), 0o600)
+        if descriptor < 0, !create, errno == ENOENT { return }
+        guard descriptor >= 0 else { throw LibraryError.storage }
+        defer { Darwin.close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == getuid(), info.st_nlink == 1,
+              fchmod(descriptor, 0o600) == 0 else { throw LibraryError.storage }
+    }
+
+    private func hardenSidecars() throws {
+        try secureDatabaseFile("history.sqlite-wal")
+        try secureDatabaseFile("history.sqlite-shm")
+        try secureDatabaseFile("history.sqlite-journal")
+    }
+
+    /// 索引是可重建的优化，不是历史库可用性的前提；不支持 FTS5/trigram 时继续 LIKE。
+    private func configureSearch() throws {
+        var supported = false
+        if enablesTrigram {
+            do {
+                try execute("CREATE VIRTUAL TABLE temp.trigram_probe USING fts5(value,tokenize='trigram',detail=full)")
+                try execute("DROP TABLE temp.trigram_probe")
+                supported = true
+            } catch {
+                try? execute("DROP TABLE IF EXISTS temp.trigram_probe")
+            }
+        }
+        if supported {
+            do {
+                try transaction {
+                    let existed = try scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entry_search'") > 0
+                    let triggers = try scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('entry_search_ai','entry_search_ad','entry_search_au')")
+                    let dirty = try scalar("SELECT dirty FROM search_meta WHERE id=1") != 0
+                    try dropSearchTriggers()
+                    try execute("CREATE VIRTUAL TABLE IF NOT EXISTS entry_search USING fts5(search_text,content='entry',content_rowid='rowid',tokenize='trigram',detail=full)")
+                    if !existed || dirty || triggers != 3 { try execute("INSERT INTO entry_search(entry_search) VALUES('rebuild')") }
+                    try execute("""
+                        CREATE TRIGGER entry_search_ai AFTER INSERT ON entry BEGIN
+                            INSERT INTO entry_search(rowid,search_text) VALUES(new.rowid,new.search_text); END;
+                        CREATE TRIGGER entry_search_ad AFTER DELETE ON entry BEGIN
+                            INSERT INTO entry_search(entry_search,rowid,search_text) VALUES('delete',old.rowid,old.search_text); END;
+                        CREATE TRIGGER entry_search_au AFTER UPDATE OF search_text ON entry BEGIN
+                            INSERT INTO entry_search(entry_search,rowid,search_text) VALUES('delete',old.rowid,old.search_text);
+                            INSERT INTO entry_search(rowid,search_text) VALUES(new.rowid,new.search_text); END;
+                        UPDATE search_meta SET dirty=0 WHERE id=1;
+                        """)
+                }
+                hasTrigram = true
+                return
+            } catch {
+                logger.warning("Optional search index unavailable; using exact substring scan")
+            }
+        }
+        // 能力缺失期间不让旧 FTS 触发器破坏写入，并记录下次支持时必须重建。
+        try transaction {
+            try dropSearchTriggers()
+            try execute("""
+                UPDATE search_meta SET dirty=1 WHERE id=1;
+                CREATE TRIGGER entry_search_ai AFTER INSERT ON entry BEGIN UPDATE search_meta SET dirty=1 WHERE id=1; END;
+                CREATE TRIGGER entry_search_ad AFTER DELETE ON entry BEGIN UPDATE search_meta SET dirty=1 WHERE id=1; END;
+                CREATE TRIGGER entry_search_au AFTER UPDATE OF search_text ON entry BEGIN UPDATE search_meta SET dirty=1 WHERE id=1; END;
+                """)
+        }
+        hasTrigram = false
+    }
+
+    private func dropSearchTriggers() throws {
+        try execute("""
+            DROP TRIGGER IF EXISTS entry_search_ai;
+            DROP TRIGGER IF EXISTS entry_search_ad;
+            DROP TRIGGER IF EXISTS entry_search_au;
+            """)
+    }
+
+    /// 仅扫描文件名元数据；迁移时同时接受旧显示键与稳定键，不修改原始表示。
     private func reclassifyImageFiles() throws {
         let query = try statement("""
             SELECT e.id,e.title,e.excerpt,COUNT(DISTINCT r.item_order)
             FROM entry e JOIN representation r ON r.entry_id=e.id AND r.uti='public.file-url'
-            WHERE e.kind=? GROUP BY e.id
-            """, [.text(ClipKind.file.rawValue)])
+            WHERE e.kind IN (?,?) GROUP BY e.id
+            """, [.text(ClipKind.file.rawValue), .text(ClipKind.file.storageValue)])
         defer { sqlite3_finalize(query) }
         var ids: [String] = []
-        while true {
-            let status = sqlite3_step(query)
-            if status == SQLITE_DONE { break }
-            guard status == SQLITE_ROW else { throw LibraryError.storage }
+        while try next(query) {
             let count = Int(sqlite3_column_int(query, 3))
             let names = text(query, 2).split(separator: "\n").map(String.init)
             let candidates = count == 1 ? [text(query, 1)] : names
-            if candidates.count == count, ClipboardFormats.areImageFiles(candidates) {
-                ids.append(text(query, 0))
-            }
+            if candidates.count == count, ClipboardFormats.areImageFiles(candidates) { ids.append(text(query, 0)) }
         }
-        for id in ids { try execute("UPDATE entry SET kind=? WHERE id=?", [.text(ClipKind.image.rawValue), .text(id)]) }
+        for id in ids { try execute("UPDATE entry SET kind=? WHERE id=?", [.text(ClipKind.image.storageValue), .text(id)]) }
     }
 
-    /// 运行预定义 SQL，写入使用参数绑定；调用方负责事务边界。
+    /// 所有修改事务内不检查任务取消：开始后必须完整提交或回滚。
+    private func transaction<T>(_ operation: () throws -> T) throws -> T {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let result = try operation()
+            try execute("COMMIT")
+            return result
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
     private func execute(_ sql: String, _ values: [SQLValue] = []) throws {
-        // Schema 初始化包含多个固定语句，不接收用户输入。
         if values.isEmpty && sql.contains(";") {
             guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else { throw LibraryError.storage }
             return
         }
-        let statement = try statement(sql, values)
-        defer { sqlite3_finalize(statement) }
-        let result = sqlite3_step(statement)
-        guard result == SQLITE_DONE || result == SQLITE_ROW else { throw LibraryError.storage }
+        let prepared = try statement(sql, values)
+        defer { sqlite3_finalize(prepared) }
+        // PRAGMA 可能返回一行；必须继续到 DONE，不能把后续错误当作成功。
+        while try next(prepared) { }
     }
 
-    /// 绑定所有用户输入；返回的语句必须由调用方 finalize。
     private func statement(_ sql: String, _ values: [SQLValue] = []) throws -> OpaquePointer {
         guard let database else { throw LibraryError.storage }
         var prepared: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &prepared, nil) == SQLITE_OK, let prepared else { throw LibraryError.storage }
+        guard sqlite3_prepare_v2(database, sql, -1, &prepared, nil) == SQLITE_OK, let prepared else {
+            sqlite3_finalize(prepared)
+            throw LibraryError.storage
+        }
         for (offset, value) in values.enumerated() {
             let index = Int32(offset + 1)
             let result: Int32
             switch value {
-            case .text(let text): result = sqlite3_bind_text(prepared, index, text, -1, transient)
-            case .integer(let number): result = sqlite3_bind_int64(prepared, index, Int64(number))
-            case .real(let number): result = sqlite3_bind_double(prepared, index, number)
+            case .text(let value): result = sqlite3_bind_text(prepared, index, value, Int32(value.utf8.count), transient)
+            case .integer(let value): result = sqlite3_bind_int64(prepared, index, Int64(value))
+            case .real(let value): result = sqlite3_bind_double(prepared, index, value)
             }
             if result != SQLITE_OK { sqlite3_finalize(prepared); throw LibraryError.storage }
         }
         return prepared
     }
 
+    /// 任何 SQLite 错误都向上传递，尤其不能让不完整的资产引用扫描触发误删。
+    private func next(_ query: OpaquePointer) throws -> Bool {
+        let status = sqlite3_step(query)
+        guard status == SQLITE_ROW || status == SQLITE_DONE else { throw LibraryError.storage }
+        return status == SQLITE_ROW
+    }
+
     private func scalar(_ sql: String, _ values: [SQLValue] = []) throws -> Int {
         let query = try statement(sql, values)
         defer { sqlite3_finalize(query) }
-        guard sqlite3_step(query) == SQLITE_ROW else { throw LibraryError.storage }
-        return Int(sqlite3_column_int64(query, 0))
+        guard try next(query) else { throw LibraryError.storage }
+        let value = Int(sqlite3_column_int64(query, 0))
+        guard try !next(query) else { throw LibraryError.storage }
+        return value
     }
 
     private func text(_ query: OpaquePointer, _ column: Int32) -> String {
         guard let value = sqlite3_column_text(query, column) else { return "" }
-        return String(cString: value)
+        return String(decoding: UnsafeBufferPointer(start: value, count: Int(sqlite3_column_bytes(query, column))), as: UTF8.self)
     }
 
-    /// 所有筛选在磁盘查询层执行；LIMIT 控制投影量，不读取内容文件。
-    /// 非空关键词仅匹配文本 / 链接内容或文件名称；图片不参与搜索，分组仅作为独立范围筛选。
+    /// 3 个及以上码点使用 trigram 候选，仍以转义 LIKE 精确复核；短查询保持子串扫描。
+    /// 取消只能在语句之间 / 行之间生效，不承诺中断正在运行的 sqlite3_step。
     func page(query: String, scope: String, kind: ClipKind?, interval: DateInterval?, limit: Int) throws -> HistoryPage {
+        try Task.checkCancellation()
         try prepare()
+        try Task.checkCancellation()
         var clauses = ["1=1"]
         var values: [SQLValue] = []
         if scope == "pinned" { clauses.append("e.pinned=1") }
@@ -230,51 +418,82 @@ actor HistoryStore {
             clauses.append("EXISTS(SELECT 1 FROM entry_group eg WHERE eg.entry_id=e.id AND eg.group_id=?)")
             values.append(.text(id.uuidString))
         }
-        if let kind { clauses.append("e.kind=?"); values.append(.text(kind.rawValue)) }
-        // 参数绑定时间边界，在 LIMIT 前过滤全库，计数与分页使用相同条件。
+        if let kind { clauses.append("e.kind=?"); values.append(.text(kind.storageValue)) }
         if let interval {
             clauses.append("e.copied_at>=? AND e.copied_at<?")
             values += [.real(interval.start.timeIntervalSince1970), .real(interval.end.timeIntervalSince1970)]
         }
         if !query.isEmpty {
-            let escaped = String(query.prefix(256)).replacingOccurrences(of: "\\", with: "\\\\")
+            let term = String(query.prefix(256))
+            let escaped = term.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
-            // 按可见类型限制搜索，旧图片索引即使含文件名也不能命中，无需改写历史数据。
-            // search_text 在文本 / 链接中保存内容，在文件中仅保存文件名，不检索分组名或路径。
+            if hasTrigram, term.unicodeScalars.count >= 3, !term.contains("\0") {
+                clauses.append("e.rowid IN (SELECT rowid FROM entry_search WHERE entry_search MATCH ?)")
+                values.append(.text("\"" + term.replacingOccurrences(of: "\"", with: "\"\"") + "\""))
+            }
             clauses.append("e.kind IN (?,?,?) AND e.search_text LIKE ? ESCAPE '\\'")
-            values += [.text(ClipKind.text.rawValue), .text(ClipKind.link.rawValue), .text(ClipKind.file.rawValue), .text("%\(escaped)%")]
+            values += [.text(ClipKind.text.storageValue), .text(ClipKind.link.storageValue), .text(ClipKind.file.storageValue), .text("%\(escaped)%")]
         }
         let filter = clauses.joined(separator: " AND ")
         let count = try scalar("SELECT COUNT(*) FROM entry e WHERE \(filter)", values)
-        let queryStatement = try statement("SELECT e.id,e.kind,e.title,e.excerpt,e.source,e.copied_at,e.byte_size,e.pinned,e.copies,e.source_bundle_id,EXISTS(SELECT 1 FROM representation r WHERE r.entry_id=e.id AND r.uti='public.file-url') FROM entry e WHERE \(filter) ORDER BY e.pinned DESC,e.copied_at DESC,e.id LIMIT ?", values + [.integer(min(max(limit, 1), StorageLimits.maximumLoaded))])
-        defer { sqlite3_finalize(queryStatement) }
+        try Task.checkCancellation()
         var clips: [Clip] = []
-        while true {
-            let status = sqlite3_step(queryStatement)
-            if status == SQLITE_DONE { break }
-            guard status == SQLITE_ROW, let id = UUID(uuidString: text(queryStatement, 0)), let kind = ClipKind(rawValue: text(queryStatement, 1)) else { throw LibraryError.storage }
-            let relations = try statement("SELECT group_id FROM entry_group WHERE entry_id=?", [.text(id.uuidString)])
-            var groups: Set<UUID> = []
-            while sqlite3_step(relations) == SQLITE_ROW { if let group = UUID(uuidString: text(relations, 0)) { groups.insert(group) } }
-            sqlite3_finalize(relations)
-            clips.append(Clip(id: id, kind: kind, title: text(queryStatement, 2), source: text(queryStatement, 4), sourceBundleID: text(queryStatement, 9),
-                              copiedAt: Date(timeIntervalSince1970: sqlite3_column_double(queryStatement, 5)),
-                              byteSize: Int(sqlite3_column_int64(queryStatement, 6)), pinned: sqlite3_column_int(queryStatement, 7) != 0,
-                              groups: groups, copies: Int(sqlite3_column_int(queryStatement, 8)), excerpt: text(queryStatement, 3), hasFileReference: sqlite3_column_int(queryStatement, 10) != 0))
+        // 不使用 COUNT OVER 强制完成全体排序；无结果时也必须保留独立全库统计。
+        if count > 0 {
+            let queryStatement = try statement("""
+                SELECT e.id,e.kind,e.title,e.excerpt,e.source,e.copied_at,e.byte_size,e.pinned,e.copies,e.source_bundle_id,
+                    EXISTS(SELECT 1 FROM representation r WHERE r.entry_id=e.id AND r.uti='public.file-url')
+                FROM entry e WHERE \(filter) ORDER BY e.pinned DESC,e.copied_at DESC,e.id LIMIT ?
+                """, values + [.integer(min(max(limit, 1), StorageLimits.maximumLoaded))])
+            defer { sqlite3_finalize(queryStatement) }
+            while try next(queryStatement) {
+                try Task.checkCancellation()
+                guard let id = UUID(uuidString: text(queryStatement, 0)) else { throw LibraryError.storage }
+                clips.append(Clip(id: id, kind: ClipKind.fromStorageValue(text(queryStatement, 1)),
+                    title: text(queryStatement, 2), source: text(queryStatement, 4), sourceBundleID: text(queryStatement, 9),
+                    copiedAt: Date(timeIntervalSince1970: sqlite3_column_double(queryStatement, 5)),
+                    byteSize: Int(sqlite3_column_int64(queryStatement, 6)), pinned: sqlite3_column_int(queryStatement, 7) != 0,
+                    groups: [], copies: Int(sqlite3_column_int(queryStatement, 8)), excerpt: text(queryStatement, 3),
+                    hasFileReference: sqlite3_column_int(queryStatement, 10) != 0))
+            }
         }
+        try Task.checkCancellation()
+        // 只为当前最多 300 条取关联，一条有界查询替代每行一个 SELECT。
+        if !clips.isEmpty {
+            let placeholders = Array(repeating: "?", count: clips.count).joined(separator: ",")
+            let relations = try statement("SELECT entry_id,group_id FROM entry_group WHERE entry_id IN (\(placeholders))",
+                clips.map { .text($0.id.uuidString) })
+            defer { sqlite3_finalize(relations) }
+            var groups: [UUID: Set<UUID>] = [:]
+            while try next(relations) {
+                try Task.checkCancellation()
+                guard let id = UUID(uuidString: text(relations, 0)), let group = UUID(uuidString: text(relations, 1)) else { throw LibraryError.storage }
+                groups[id, default: []].insert(group)
+            }
+            clips = clips.map { clip in
+                Clip(id: clip.id, kind: clip.kind, title: clip.title, source: clip.source, sourceBundleID: clip.sourceBundleID,
+                    copiedAt: clip.copiedAt, byteSize: clip.byteSize, pinned: clip.pinned, groups: groups[clip.id] ?? [],
+                    copies: clip.copies, excerpt: clip.excerpt, hasFileReference: clip.hasFileReference)
+            }
+        }
+        try Task.checkCancellation()
         let stats = try storageStats()
-        return HistoryPage(clips: clips, total: count,
-                           storedEntries: stats.entries, storedBytes: stats.bytes)
+        return HistoryPage(clips: clips, total: count, storedEntries: stats.entries, storedBytes: stats.bytes)
     }
 
-    /// 读取全库条数和内容表示总字节；不受列表筛选影响，供设置页容量展示使用。
+    /// 容量只在内容变更后重算；分组、置顶及普通搜索不重复扫描 SUM。
     func storageStats() throws -> StorageStats {
         try prepare()
-        return StorageStats(entries: try scalar("SELECT COUNT(*) FROM entry"),
-                            bytes: try scalar("SELECT COALESCE(SUM(byte_size),0) FROM entry"))
+        if let cachedStats { return cachedStats }
+        let query = try statement("SELECT COUNT(*),COALESCE(SUM(byte_size),0) FROM entry")
+        defer { sqlite3_finalize(query) }
+        guard try next(query) else { throw LibraryError.storage }
+        let stats = StorageStats(entries: Int(sqlite3_column_int64(query, 0)), bytes: Int(sqlite3_column_int64(query, 1)))
+        guard try !next(query) else { throw LibraryError.storage }
+        cachedStats = stats
+        return stats
     }
 
-    /// 独立读取完整分组目录，不依赖历史列表筛选、分页或搜索结果。
     func groupCatalog() throws -> [ClipGroup] {
         try prepare()
         return try readGroups()
@@ -284,153 +503,194 @@ actor HistoryStore {
         let query = try statement("SELECT id,name,color FROM user_group ORDER BY position,id")
         defer { sqlite3_finalize(query) }
         var groups: [ClipGroup] = []
-        while sqlite3_step(query) == SQLITE_ROW {
+        while try next(query) {
             guard let id = UUID(uuidString: text(query, 0)) else { throw LibraryError.storage }
             groups.append(ClipGroup(id: id, name: text(query, 1), colorIndex: Int(sqlite3_column_int(query, 2))))
         }
         return groups
     }
 
-    /// 对 RTF-only 内容补充有界摘要和搜索文本，HTML-only 不使用 WebKit 隐式渲染。
+    /// 摘要 / 搜索允许有界回退；不改变原始表示，也不在主线程解析 RTF。
     private func readableCapture(_ capture: ClipCapture) -> ClipCapture {
         guard capture.kind == .text, capture.searchText.isEmpty else { return capture }
-        let parts = capture.representations.filter { $0.type == "public.rtf" }
         var remaining = ClipboardFormats.maximumRichTextPreviewBytes
         var strings: [String] = []
-        for part in parts {
+        for part in capture.representations where part.type == "public.rtf" {
             guard part.data.count <= remaining else { break }
             remaining -= part.data.count
             if let value = ClipboardFormats.richText(part.data) { strings.append(value) }
         }
-        let text = String(strings.joined(separator: "\n").prefix(StorageLimits.searchableCharacters))
-        guard !text.isEmpty else { return capture }
-        let title = String(text.split(whereSeparator: \.isNewline).first?.prefix(120) ?? "富文本内容")
-        return ClipCapture(kind: capture.kind, title: title, excerpt: String(text.prefix(240)), searchText: text,
-                           source: capture.source, sourceBundleID: capture.sourceBundleID, representations: capture.representations)
+        let value = String(strings.joined(separator: "\n").prefix(StorageLimits.searchableCharacters))
+        guard !value.isEmpty else { return capture }
+        return ClipCapture(kind: capture.kind, title: String(value.split(whereSeparator: \.isNewline).first?.prefix(120) ?? "富文本内容"),
+            excerpt: String(value.prefix(240)), searchText: value, source: capture.source,
+            sourceBundleID: capture.sourceBundleID, representations: capture.representations)
     }
 
-    /// 快照先写独立文件，再用事务发布；失败回收新文件，不破坏已有内容。
-    func save(_ capture: ClipCapture, retention: Int) throws {
+    /// 清理与入库共享一个事务；失败不删除旧元数据 / 资产，提交后才 unlink 被回收的文件。
+    /// 重复采集同样执行保留期清理，先更新时间以保留刚复制的那条记录。
+    func save(_ original: ClipCapture, retention: Int) throws {
         try prepare()
-        guard let root, !capture.representations.isEmpty else { throw LibraryError.storage }
-        // 不在主线程解析富文本；仅补全缺少纯文本表示的 RTF 摘要，不修改原始表示。
-        let capture = readableCapture(capture)
-        let bytes = capture.representations.reduce(0) { $0 + $1.data.count }
+        guard !original.representations.isEmpty, original.representations.count <= StorageLimits.maximumRepresentations,
+              original.representations.allSatisfy({ $0.data.count <= StorageLimits.maximumRepresentationBytes }) else { throw LibraryError.unsupported }
+        let bytes = original.representations.reduce(0) { $0 + $1.data.count }
         guard bytes <= StorageLimits.maximumCaptureBytes else { throw LibraryError.unsupported }
+        let capture = readableCapture(original)
         var hasher = SHA256()
-        // 类型、item 边界和长度参与指纹，避免不同表示的串联碰撞。
         for representation in capture.representations {
             hasher.update(data: Data("\(representation.item):\(representation.type):\(representation.data.count):".utf8))
             hasher.update(data: representation.data)
         }
         let fingerprint = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        if try scalar("SELECT COUNT(*) FROM entry WHERE fingerprint=?", [.text(fingerprint)]) > 0 {
-            try execute("UPDATE entry SET copied_at=?,copies=copies+1,source=?,source_bundle_id=? WHERE fingerprint=?", [.real(Date().timeIntervalSince1970), .text(capture.source), .text(capture.sourceBundleID), .text(fingerprint)])
-            return
-        }
-        try prune(retention: retention, incoming: bytes)
-        let id = UUID().uuidString
-        var written: [URL] = []
+        var written: [String] = []
+        var removed: [String] = []
+        var prunedIDs: [UUID] = []
         do {
-            try execute("BEGIN IMMEDIATE")
-            try execute("INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,source_bundle_id,copied_at,byte_size) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        [.text(id), .text(fingerprint), .text(capture.kind.rawValue), .text(capture.title), .text(capture.excerpt),
+            try hardenSidecars()
+            try transaction {
+                let duplicate = try scalar("SELECT COUNT(*) FROM entry WHERE fingerprint=?", [.text(fingerprint)]) > 0
+                if duplicate {
+                    try execute("UPDATE entry SET copied_at=?,copies=copies+1,source=?,source_bundle_id=? WHERE fingerprint=?",
+                        [.real(Date().timeIntervalSince1970), .text(capture.source), .text(capture.sourceBundleID), .text(fingerprint)])
+                }
+                let pruned = try prune(retention: retention, incoming: duplicate ? 0 : bytes, addingEntry: !duplicate)
+                removed = pruned.filenames
+                prunedIDs = pruned.ids
+                if !duplicate {
+                    let id = UUID().uuidString
+                    try execute("INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,source_bundle_id,copied_at,byte_size) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        [.text(id), .text(fingerprint), .text(capture.kind.storageValue), .text(capture.title), .text(capture.excerpt),
                          .text(String(capture.searchText.prefix(StorageLimits.searchableCharacters))), .text(capture.source), .text(capture.sourceBundleID),
                          .real(Date().timeIntervalSince1970), .integer(bytes)])
-            for representation in capture.representations {
-                let assetID = UUID().uuidString
-                let url = root.appendingPathComponent("assets/\(assetID)")
-                try representation.data.write(to: url, options: .atomic)
-                written.append(url)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-                try execute("INSERT INTO representation(id,entry_id,item_order,uti,filename,byte_size) VALUES(?,?,?,?,?,?)",
-                            [.text(assetID), .text(id), .integer(representation.item), .text(representation.type), .text(assetID), .integer(representation.data.count)])
+                    for representation in capture.representations {
+                        let name = UUID().uuidString
+                        try writeAsset(representation.data, name: name)
+                        written.append(name)
+                        try execute("INSERT INTO representation(id,entry_id,item_order,uti,filename,byte_size) VALUES(?,?,?,?,?,?)",
+                            [.text(name), .text(id), .integer(representation.item), .text(representation.type), .text(name), .integer(representation.data.count)])
+                    }
+                }
             }
-            try execute("COMMIT")
         } catch {
-            try? execute("ROLLBACK")
-            for url in written { try? FileManager.default.removeItem(at: url) }
+            unlinkAssets(written)
             logger.error("Capture transaction failed; new assets rolled back")
-            throw LibraryError.storage
+            throw error
         }
+        cachedStats = nil
+        for id in prunedIDs { invalidateThumbnail(id) }
+        unlinkAssets(removed)
     }
 
-    /// 清理仅删除非保护记录；超过保护容量时拒绝新内容，不无限增长磁盘。
-    private func prune(retention: Int, incoming: Int) throws {
-        // 本 actor 内没有挂起点，容量预检与后续清理之间不会插入其他存储操作。
-        // 即使回收全部非保护内容也放不下时直接拒绝，不能先删除历史再报容量不足。
-        let protectedFilter = "pinned=1 OR EXISTS(SELECT 1 FROM entry_group WHERE entry_id=entry.id)"
-        let protectedCount = try scalar("SELECT COUNT(*) FROM entry WHERE \(protectedFilter)")
-        let protectedBytes = try scalar("SELECT COALESCE(SUM(byte_size),0) FROM entry WHERE \(protectedFilter)")
-        guard protectedCount < StorageLimits.maximumEntries,
-              protectedBytes + incoming <= StorageLimits.maximumBytes else { throw LibraryError.capacity }
-        // 0 天表示不按时间清理；容量超限时仍从最旧的非保护记录开始回收。
-        let cutoff = retention > 0
-            ? Date().addingTimeInterval(-Double(retention) * 86_400).timeIntervalSince1970
-            : -Double.greatestFiniteMagnitude
-        var count = try scalar("SELECT COUNT(*) FROM entry")
-        var bytes = try scalar("SELECT COALESCE(SUM(byte_size),0) FROM entry")
-        // 常规入库只取一个候选，不为每次复制构造全库候选数组。
+    /// 一次聚合容量，最多 256 个一批读取 / 删除；始终保留置顶与已分组记录。
+    private func prune(retention: Int, incoming: Int, addingEntry: Bool) throws -> (ids: [UUID], filenames: [String]) {
+        let query = try statement("""
+            SELECT COUNT(*),COALESCE(SUM(byte_size),0),
+                COALESCE(SUM(CASE WHEN pinned=1 OR EXISTS(SELECT 1 FROM entry_group WHERE entry_id=entry.id) THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN pinned=1 OR EXISTS(SELECT 1 FROM entry_group WHERE entry_id=entry.id) THEN byte_size ELSE 0 END),0)
+            FROM entry
+            """)
+        var count: Int
+        var bytes: Int
+        do {
+            defer { sqlite3_finalize(query) }
+            guard try next(query) else { throw LibraryError.storage }
+            count = Int(sqlite3_column_int64(query, 0))
+            bytes = Int(sqlite3_column_int64(query, 1))
+            let protectedCount = Int(sqlite3_column_int64(query, 2))
+            let protectedBytes = Int(sqlite3_column_int64(query, 3))
+            guard protectedCount + (addingEntry ? 1 : 0) <= StorageLimits.maximumEntries,
+                  protectedBytes <= StorageLimits.maximumBytes - incoming else { throw LibraryError.capacity }
+            guard try !next(query) else { throw LibraryError.storage }
+        }
+        let cutoff = retention > 0 ? Date().addingTimeInterval(-Double(retention) * 86_400).timeIntervalSince1970 : -Double.greatestFiniteMagnitude
+        func overBudget() -> Bool { count + (addingEntry ? 1 : 0) > StorageLimits.maximumEntries || bytes > StorageLimits.maximumBytes - incoming }
+        var ids: [UUID] = []
+        var filenames: [String] = []
         while true {
-            let overBudget = count >= StorageLimits.maximumEntries || bytes + incoming > StorageLimits.maximumBytes
-            let query = try statement("SELECT id,byte_size FROM entry WHERE pinned=0 AND NOT EXISTS(SELECT 1 FROM entry_group WHERE entry_id=entry.id) AND (?=1 OR copied_at<?) ORDER BY copied_at LIMIT 1",
-                                      [.integer(overBudget ? 1 : 0), .real(cutoff)])
-            let status = sqlite3_step(query)
-            if status == SQLITE_DONE { sqlite3_finalize(query); break }
-            guard status == SQLITE_ROW, let id = UUID(uuidString: text(query, 0)) else {
-                sqlite3_finalize(query); throw LibraryError.storage
+            let candidates = try statement("""
+                SELECT id,byte_size,copied_at FROM entry
+                WHERE pinned=0 AND NOT EXISTS(SELECT 1 FROM entry_group WHERE entry_id=entry.id)
+                    AND (?=1 OR copied_at<?) ORDER BY copied_at,id LIMIT 256
+                """, [.integer(overBudget() ? 1 : 0), .real(cutoff)])
+            var batch: [UUID] = []
+            do {
+                defer { sqlite3_finalize(candidates) }
+                while try next(candidates) {
+                    guard let id = UUID(uuidString: text(candidates, 0)) else { throw LibraryError.storage }
+                    if overBudget() || sqlite3_column_double(candidates, 2) < cutoff {
+                        let size = Int(sqlite3_column_int64(candidates, 1))
+                        guard size >= 0 else { throw LibraryError.storage }
+                        batch.append(id)
+                        count -= 1
+                        bytes -= size
+                    }
+                }
             }
-            let size = Int(sqlite3_column_int64(query, 1))
-            sqlite3_finalize(query)
-            try delete(id)
-            count -= 1
-            bytes -= size
+            guard !batch.isEmpty else { break }
+            filenames += try assetNames(for: batch)
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            try execute("DELETE FROM entry WHERE id IN (\(placeholders))", batch.map { .text($0.uuidString) })
+            ids += batch
         }
-        guard count < StorageLimits.maximumEntries, bytes + incoming <= StorageLimits.maximumBytes else { throw LibraryError.capacity }
+        guard !overBudget() else { throw LibraryError.capacity }
+        return (ids, filenames)
     }
 
-    /// 仅删除 UUID 命名的应用资产，绝不删除用户原文件；数据库提交后清理文件。
+    private func assetNames(for ids: [UUID]) throws -> [String] {
+        guard !ids.isEmpty else { return [] }
+        let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
+        let query = try statement("SELECT filename FROM representation WHERE entry_id IN (\(placeholders))", ids.map { .text($0.uuidString) })
+        defer { sqlite3_finalize(query) }
+        var names: [String] = []
+        while try next(query) {
+            let name = text(query, 0)
+            guard UUID(uuidString: name) != nil else { throw LibraryError.storage }
+            names.append(name)
+        }
+        return names
+    }
+
     func delete(_ id: UUID) throws {
         try prepare()
-        let query = try statement("SELECT filename FROM representation WHERE entry_id=?", [.text(id.uuidString)])
-        var filenames: [String] = []
-        while sqlite3_step(query) == SQLITE_ROW { filenames.append(text(query, 0)) }
-        sqlite3_finalize(query)
-        try execute("DELETE FROM entry WHERE id=?", [.text(id.uuidString)])
-        thumbnails.removeValue(forKey: id)
-        thumbnailOrder.removeAll { $0 == id }
-        for filename in filenames { if let url = assetURL(filename) { try? FileManager.default.removeItem(at: url) } }
+        let names = try transaction {
+            let names = try assetNames(for: [id])
+            try execute("DELETE FROM entry WHERE id=?", [.text(id.uuidString)])
+            return names
+        }
+        cachedStats = nil
+        invalidateThumbnail(id)
+        unlinkAssets(names)
     }
 
-    /// 清空内容但保留分组结构，不删除任何剪贴板引用的原文件；返回删除条数。
+    /// 删除提交是成功边界；资产回收 / checkpoint 失败不伪装成删除回滚。
+    /// 不自动 VACUUM：空闲页留待复用，不保证文件缩小或安全擦除已删除正文。
     @discardableResult
-    func clear() throws -> Int {
-        try prepare()
-        let removed = try scalar("SELECT COUNT(*) FROM entry")
-        try execute("DELETE FROM entry")
-        try finishCleanup()
-        return removed
-    }
+    func clear() throws -> Int { try clearEntries(before: nil) }
 
-    /// 删除早于 cutoff 的记录，包含置顶与已分组内容；返回删除条数。
     @discardableResult
-    func clear(before cutoff: Date) throws -> Int {
-        try prepare()
-        let timestamp = cutoff.timeIntervalSince1970
-        let removed = try scalar("SELECT COUNT(*) FROM entry WHERE copied_at<?", [.real(timestamp)])
-        guard removed > 0 else { return 0 }
-        try execute("DELETE FROM entry WHERE copied_at<?", [.real(timestamp)])
-        try finishCleanup()
-        return removed
-    }
+    func clear(before cutoff: Date) throws -> Int { try clearEntries(before: cutoff) }
 
-    /// 清理缩略图缓存、孤立资产并回收数据库空间；分组结构不受影响。
-    private func finishCleanup() throws {
+    private func clearEntries(before cutoff: Date?) throws -> Int {
+        try prepare()
+        let values: [SQLValue] = cutoff.map { [.real($0.timeIntervalSince1970)] } ?? []
+        let filter = cutoff == nil ? "" : " WHERE copied_at<?"
+        let removed = try transaction {
+            let count = try scalar("SELECT COUNT(*) FROM entry\(filter)", values)
+            try execute("DELETE FROM entry\(filter)", values)
+            return count
+        }
+        cachedStats = nil
+        thumbnailGeneration &+= 1
         thumbnails.removeAll()
         thumbnailOrder.removeAll()
-        try recoverAssets()
-        try execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        try execute("VACUUM")
+        thumbnailBytes = 0
+        finishCleanup()
+        return removed
+    }
+
+    private func finishCleanup() {
+        do { try recoverAssets() } catch { logger.warning("Committed deletion; asset maintenance deferred") }
+        do { try execute("PRAGMA wal_checkpoint(TRUNCATE)") } catch { logger.warning("Committed deletion; checkpoint deferred") }
     }
 
     func setPinned(_ id: UUID, _ pinned: Bool) throws {
@@ -447,7 +707,6 @@ actor HistoryStore {
         }
     }
 
-    /// 编辑前校验 Unicode 大小写重名，不依赖 SQLite NOCASE 的 ASCII 限制。
     func saveGroup(_ id: UUID?, name: String) throws {
         try prepare()
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -456,47 +715,59 @@ actor HistoryStore {
               !groups.contains(where: { $0.id != id && $0.name.localizedCaseInsensitiveCompare(trimmed) == .orderedSame }) else { throw LibraryError.nameConflict }
         if let id { try execute("UPDATE user_group SET name=? WHERE id=?", [.text(trimmed), .text(id.uuidString)]) }
         else {
-            try execute("INSERT INTO user_group(id,name,color,position) VALUES(?,?,?,?)", [.text(UUID().uuidString), .text(trimmed), .integer(groups.count % 4), .integer(groups.count)])
+            try execute("INSERT INTO user_group(id,name,color,position) VALUES(?,?,?,?)",
+                [.text(UUID().uuidString), .text(trimmed), .integer(groups.count % 4), .integer(groups.count)])
         }
     }
 
-    /// 复制时才恢复有界原始表示；返回前检查文件引用，不读取文件本体。
-    func representations(_ id: UUID) throws -> [ClipRepresentation] {
+    /// SQLite 语句和保存资产先完整读取并关闭，再挂起检查外部文件；删除代数拒绝过期复制。
+    func representations(_ id: UUID) async throws -> [ClipRepresentation] {
+        try Task.checkCancellation()
         try prepare()
+        let generation = thumbnailGeneration
+        let originals = try savedRepresentations(id)
+        var references: [URL] = []
+        for representation in originals where representation.type == "public.file-url" {
+            guard let value = String(data: representation.data, encoding: .utf8), let url = URL(string: value), url.isFileURL else {
+                throw LibraryError.unavailableFile
+            }
+            references.append(url)
+        }
+        let available = await FileAvailability.shared.check(references)
+        try Task.checkCancellation()
+        guard generation == thumbnailGeneration else { throw LibraryError.missingContent }
+        guard available else { throw LibraryError.unavailableFile }
+        return originals
+    }
+
+    /// fd 相对读取，不跟随符号链接；函数返回前 finalize，不跨 await 保留 SQLite 指针。
+    private func savedRepresentations(_ id: UUID) throws -> [ClipRepresentation] {
         let query = try statement("SELECT item_order,uti,filename,byte_size FROM representation WHERE entry_id=? ORDER BY item_order,id", [.text(id.uuidString)])
         defer { sqlite3_finalize(query) }
         var result: [ClipRepresentation] = []
         var size = 0
-        while true {
-            let status = sqlite3_step(query)
-            if status == SQLITE_DONE { break }
-            guard status == SQLITE_ROW else { throw LibraryError.storage }
+        while try next(query) {
             let expected = Int(sqlite3_column_int64(query, 3))
+            guard expected >= 0, expected <= StorageLimits.maximumRepresentationBytes,
+                  size <= StorageLimits.maximumCaptureBytes - expected,
+                  result.count < StorageLimits.maximumRepresentations else { throw LibraryError.missingContent }
             size += expected
-            guard size <= StorageLimits.maximumCaptureBytes, let url = assetURL(text(query, 2)),
-                  let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-                  (attributes[.size] as? NSNumber)?.intValue == expected else { throw LibraryError.missingContent }
-            let data = try Data(contentsOf: url)
+            let data = try assetData(text(query, 2), maximum: expected, expectedSize: expected)
             let type = text(query, 1)
-            if type == "public.file-url" {
-                guard let value = String(data: data, encoding: .utf8), let file = URL(string: value), file.isFileURL,
-                      FileManager.default.isReadableFile(atPath: file.path) else { throw LibraryError.unavailableFile }
-            }
             result.append(ClipRepresentation(item: Int(sqlite3_column_int(query, 0)), type: type, data: data))
         }
         guard !result.isEmpty else { throw LibraryError.missingContent }
         return result
     }
 
-    /// 将文本 / 链接恢复为唯一的纯文本表示，不改动历史中保存的原始格式。
-    /// 优先纯文本，链接优先原始 URL；RTF 在后台提取文字，不使用可能加载外部资源的 HTML 渲染器。
-    /// 多个 item 按原顺序用换行连接；转换失败时不清空用户剪贴板。
-    func plainText(_ id: UUID, kind: ClipKind) throws -> [ClipRepresentation] {
+    /// 原始纯文本 / URL 优先；RTF 共享 256 KiB 解析预算，超限明确失败，绝不返回截断粘贴。
+    func plainText(_ id: UUID, kind: ClipKind) async throws -> [ClipRepresentation] {
         guard kind == .text || kind == .link else { throw LibraryError.unsupported }
-        let originals = try representations(id)
+        let originals = try await representations(id)
         let indices = Set(originals.map(\.item)).sorted()
         var parts: [String] = []
         var bytes = 0
+        var richTextBudget = ClipboardFormats.maximumRichTextPreviewBytes
         for index in indices {
             let items = originals.filter { $0.item == index }
             let types = kind == .link ? ["public.url", "public.utf8-plain-text"] : ["public.utf8-plain-text", "public.url"]
@@ -508,6 +779,8 @@ actor HistoryStore {
                 }
             }
             if value == nil, let rtf = items.first(where: { $0.type == "public.rtf" }) {
+                guard rtf.data.count <= richTextBudget else { throw LibraryError.richTextTooLarge }
+                richTextBudget -= rtf.data.count
                 value = try NSAttributedString(data: rtf.data, options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil).string
             }
             guard let value else { throw LibraryError.plainTextUnavailable }
@@ -520,24 +793,21 @@ actor HistoryStore {
         return [ClipRepresentation(item: 0, type: "public.utf8-plain-text", data: data)]
     }
 
-    /// 用户从历史再次复制后更新排序和次数，不重复采集自身写入内容。
     func markCopied(_ id: UUID) throws {
         try prepare()
         try execute("UPDATE entry SET copied_at=?,copies=copies+1 WHERE id=?", [.real(Date().timeIntervalSince1970), .text(id.uuidString)])
     }
 
-    /// 按 item 原顺序聚合文本，文件引用仅展示文件名，不将本地路径交付预览。
-    /// 整条详情共享 16 KB 文本及 256 KB RTF 解析预算，只生成一张缩略图。
+    /// 整条详情共享 16 KB 文本 / 256 KiB RTF 预算；420px 与列表 640px 共用同一有界缓存。
     func preview(_ id: UUID) async throws -> ClipPreview {
+        try Task.checkCancellation()
         try prepare()
-        // 显式排序表示优先级，避免随机资产 UUID 决定同一 item 展示哪种文本。
         var preview = ""
         var textItems: Set<Int> = []
         var richTextBudget = ClipboardFormats.maximumRichTextPreviewBytes
         var truncated = false
         var storedThumbnail: URL?
         var referencedThumbnail: URL?
-        // 预留截断提示空间，正文与提示合计不超过 16 KB。
         let textBudget = 16_000
         do {
             let query = try statement("""
@@ -547,38 +817,30 @@ actor HistoryStore {
                     WHEN 'public.rtf' THEN 3 ELSE 4 END,id
                 """, [.text(id.uuidString)])
             defer { sqlite3_finalize(query) }
-            while true {
-                let status = sqlite3_step(query)
-                if status == SQLITE_DONE { break }
-                guard status == SQLITE_ROW else { throw LibraryError.storage }
+            while try next(query) {
+                try Task.checkCancellation()
                 let type = text(query, 0)
                 let item = Int(sqlite3_column_int(query, 2))
-                guard let url = assetURL(text(query, 1)) else { continue }
-                // 缩略图只记录候选；查询结束后再在 actor 外生成，引用文件阻塞时不影响其他存储操作。
+                let name = text(query, 1)
+                guard let url = assetURL(name) else { throw LibraryError.storage }
                 if ClipboardFormats.rasterImages.contains(type) {
                     if storedThumbnail == nil { storedThumbnail = url }
-                } else if type == "public.file-url", referencedThumbnail == nil {
-                    referencedThumbnail = url
-                }
-                // 缺失或无法解析的表示不占用 item，允许其他格式继续回退。
+                } else if type == "public.file-url", referencedThumbnail == nil { referencedThumbnail = url }
                 if !textItems.contains(item) {
                     let separator = preview.isEmpty ? "" : "\n"
                     let remaining = textBudget - preview.utf8.count - separator.utf8.count
                     var value: String?
                     if type == "public.file-url" {
-                        // 路径只用于内部读取与再次复制，预览仅交付解码后的末级文件名。
-                        if let data = previewData(url, maximum: 16_385), data.count <= 16_384,
+                        if let data = try? assetData(name, maximum: 16_385), data.count <= 16_384,
                            let raw = String(data: data, encoding: .utf8),
-                           let reference = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-                           reference.isFileURL {
+                           let reference = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)), reference.isFileURL {
                             value = reference.lastPathComponent
                         }
                     } else if ["public.utf8-plain-text", "public.url"].contains(type) {
-                        if let data = previewData(url, maximum: max(1, remaining + 1)), !data.isEmpty {
+                        if let data = try? assetData(name, maximum: max(1, remaining + 1)), !data.isEmpty {
                             value = String(decoding: data, as: UTF8.self)
                         }
-                    } else if type == "public.rtf",
-                              let data = previewData(url, maximum: richTextBudget + 1), data.count <= richTextBudget {
+                    } else if type == "public.rtf", let data = try? assetData(name, maximum: richTextBudget + 1), data.count <= richTextBudget {
                         richTextBudget -= data.count
                         value = ClipboardFormats.richText(data)
                     }
@@ -586,169 +848,197 @@ actor HistoryStore {
                         textItems.insert(item)
                         if remaining > 0 {
                             var bounded = String(decoding: value.utf8.prefix(remaining), as: UTF8.self)
-                            // 截在多字节字符中间时替换字符可能多占字节，收紧到总预算内。
                             while bounded.utf8.count > remaining { bounded.removeLast() }
                             preview += separator + bounded
                             if bounded != value { truncated = true }
-                        } else {
-                            truncated = true
-                        }
+                        } else { truncated = true }
                     }
                 }
             }
         }
-        var thumbnail: Data?
-        if let storedThumbnail {
-            // 已保存的像素表示优先；即使同时存在文件引用，也不读取原文件。
-            thumbnail = await Self.boundedThumbnail(.stored(storedThumbnail), maximum: 420)
-        } else if let referencedThumbnail {
-            thumbnail = await Self.boundedThumbnail(.referenced(referencedThumbnail), maximum: 420)
-        }
+        try Task.checkCancellation()
+        let generation = thumbnailGeneration
+        let source = storedThumbnail.map(ThumbnailSource.stored) ?? referencedThumbnail.map(ThumbnailSource.referenced)
+        let thumbnail = await requestedThumbnail(id, source: source, maximum: 420)
+        try Task.checkCancellation()
+        guard generation == thumbnailGeneration else { return ClipPreview(text: "", thumbnail: nil) }
         if truncated { preview += "\n…预览已截断，复制保留原始内容" }
         return ClipPreview(text: preview, thumbnail: thumbnail)
     }
 
-    /// 有界读取失败时留给其他表示回退，不把单个缺失资产当成整个预览失败。
-    private func previewData(_ url: URL, maximum: Int) -> Data? {
-        guard maximum > 0, let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        return try? handle.read(upToCount: maximum)
+    private struct ThumbnailKey: Hashable {
+        let id: UUID
+        let maximum: Int
     }
 
-    /// 仅接受本地、非符号链接的普通图片文件，拒绝网络卷和未下载云文件。
-    /// 引用只保存路径，源文件删除、移动或无权限时返回空，不中断其他内容预览。
-    nonisolated private static func referencedImageThumbnail(_ asset: URL, maximum: Int) -> Data? {
-        guard let handle = try? FileHandle(forReadingFrom: asset) else { return nil }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: 16_385), data.count <= 16_384,
-              let value = String(data: data, encoding: .utf8),
-              let url = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines)),
-              url.isFileURL, url.host == nil || url.host == "" || url.host == "localhost",
-              UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true,
-              let info = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey,
-                                                          .fileSizeKey, .volumeIsLocalKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
-              info.isRegularFile == true, info.isSymbolicLink != true, info.volumeIsLocal == true,
-              (info.isUbiquitousItem != true || info.ubiquitousItemDownloadingStatus == .current
-               || info.ubiquitousItemDownloadingStatus == .downloaded), let size = info.fileSize, size > 0, size <= 64 * 1024 * 1024
-        else { return nil }
-        return makeThumbnail(url, maximum: maximum)
-    }
+    /// 只缓存像素表示，不长期复用可能被外部应用替换的文件引用。
+    private var thumbnails: [ThumbnailKey: Data] = [:]
+    private var thumbnailOrder: [ThumbnailKey] = []
+    private var thumbnailBytes = 0
+    private var activeThumbnailRequests = 0
+    /// 挂起期间发生删除 / 清空 / 自动回收时，拒绝旧解码结果重新写回缓存。
+    private var thumbnailGeneration: UInt64 = 0
 
-    /// ImageIO 直接从文件降采样，关闭原图解码缓存；输出始终受目标像素上限约束。
-    nonisolated private static func makeThumbnail(_ url: URL, maximum: Int) -> Data? {
-        let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0,
-                  [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                   kCGImageSourceThumbnailMaxPixelSize: maximum,
-                   kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { return nil }
-        let output = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(output, UTType.png.identifier as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, image, nil)
-        return CGImageDestinationFinalize(destination) ? output as Data : nil
+    private func invalidateThumbnail(_ id: UUID) {
+        thumbnailGeneration &+= 1
+        for key in thumbnailOrder where key.id == id {
+            if let old = thumbnails.removeValue(forKey: key) { thumbnailBytes -= old.count }
+        }
+        thumbnailOrder.removeAll { $0.id == id }
     }
-
-    /// 文件读取与解码可能因异常挂载点永久阻塞；放到 actor 外执行并限制等待时间。
-    /// 使用非结构化任务竞速，避免结构化任务组在退出时继续等待卡死的子任务。
-    /// 超时后记录该资产，本次运行不再重试，串行 SQLite 与列表查询继续工作。
-    nonisolated private static func boundedThumbnail(_ source: ThumbnailSource, maximum: Int) async -> Data? {
-        let key: String?
-        if case .referenced(let asset) = source {
-            key = asset.path
-            if TimedOutThumbnailCache.shared.contains(asset.path) { return nil }
-        } else {
-            key = nil
-        }
-        let generation = Task.detached(priority: .utility) {
-            generateThumbnail(source, maximum: maximum)
-        }
-        let timeout = Task.detached {
-            try? await Task.sleep(for: .seconds(3))
-            return !Task.isCancelled
-        }
-        let outcome: ThumbnailOutcome = await withCheckedContinuation { continuation in
-            let race = ThumbnailRace(continuation)
-            Task.detached {
-                let data = await generation.value
-                race.finish(.finished(data))
-            }
-            Task.detached {
-                if await timeout.value { race.finish(.timedOut) }
-            }
-        }
-        if case .timedOut = outcome {
-            if let key { TimedOutThumbnailCache.shared.insert(key) }
-            return nil
-        }
-        guard case .finished(let data) = outcome else { return nil }
-        return data
-    }
-
-    nonisolated private static func generateThumbnail(_ source: ThumbnailSource, maximum: Int) -> Data? {
-        switch source {
-        case .stored(let url): return makeThumbnail(url, maximum: maximum)
-        case .referenced(let asset): return referencedImageThumbnail(asset, maximum: maximum)
-        }
-    }
-
-    /// 列表缩略图缓存最多 24 张，总量最多 2 MB；只缓存降采样 PNG，不读取完整图片到 UI。
-    private var thumbnails: [UUID: Data] = [:]
-    private var thumbnailOrder: [UUID] = []
 
     func thumbnail(_ id: UUID) async throws -> Data? {
+        try Task.checkCancellation()
         try prepare()
         let sources = try thumbnailSources(id)
-        // 优先使用已保存的像素表示；只有没有内置图片时才读取引用文件。
         let source = sources.stored.map(ThumbnailSource.stored) ?? sources.referenced.map(ThumbnailSource.referenced)
-        guard let source else { return nil }
-        let usesReference: Bool
-        if case .referenced = source { usesReference = true } else { usesReference = false }
-        // 引用可在应用外修改、删除或撤销权限，不按记录 UUID 永久复用旧缩略图。
-        if !usesReference, let cached = thumbnails[id] { return cached }
-        guard let data = await Self.boundedThumbnail(source, maximum: 640), data.count <= 2 * 1024 * 1024 else { return nil }
-        if usesReference { return data }
-        while !thumbnailOrder.isEmpty && (thumbnailOrder.count >= 24 || thumbnails.values.reduce(0, { $0 + $1.count }) + data.count > 2 * 1024 * 1024) {
-            thumbnails.removeValue(forKey: thumbnailOrder.removeFirst())
-        }
-        thumbnails[id] = data
-        thumbnailOrder.append(id)
-        return data
+        return await requestedThumbnail(id, source: source, maximum: 640)
     }
 
-    /// 只查询候选资产，不读取文件；引用路径的校验与解码在 actor 外执行。
+    /// 最多 12 个活跃等待者；只有 BUSY 重试两次，失败 / 超时不重试，不积累无限等待队列。
+    private func requestedThumbnail(_ id: UUID, source: ThumbnailSource?, maximum: Int) async -> Data? {
+        guard let source, !Task.isCancelled else { return nil }
+        let usesReference: Bool
+        if case .referenced = source { usesReference = true } else { usesReference = false }
+        let key = ThumbnailKey(id: id, maximum: maximum)
+        if !usesReference, let cached = thumbnails[key] { return cached }
+        guard activeThumbnailRequests < 12 else { return nil }
+        activeThumbnailRequests += 1
+        defer { activeThumbnailRequests -= 1 }
+        let generation = thumbnailGeneration
+        for attempt in 0..<3 {
+            guard !Task.isCancelled, generation == thumbnailGeneration else { return nil }
+            let result = await ThumbnailPipeline.shared.thumbnailResult(source, maximum: maximum)
+            guard !Task.isCancelled, generation == thumbnailGeneration else { return nil }
+            switch result {
+            case .unavailable: return nil
+            case .busy:
+                guard attempt < 2 else { return nil }
+                do { try await Task.sleep(for: .milliseconds(attempt == 0 ? 80 : 160)) }
+                catch { return nil }
+            case .image(let data):
+                guard data.count <= 2 * 1024 * 1024 else { return nil }
+                if usesReference { return data }
+                // 多个等待者不能重复添加顺序键 / 字节数。
+                if let cached = thumbnails[key] { return cached }
+                while !thumbnailOrder.isEmpty && (thumbnailOrder.count >= 24 || thumbnailBytes + data.count > 2 * 1024 * 1024) {
+                    if let old = thumbnails.removeValue(forKey: thumbnailOrder.removeFirst()) { thumbnailBytes -= old.count }
+                }
+                thumbnails[key] = data
+                thumbnailOrder.append(key)
+                thumbnailBytes += data.count
+                return data
+            }
+        }
+        return nil
+    }
+
     private func thumbnailSources(_ id: UUID) throws -> (stored: URL?, referenced: URL?) {
         let query = try statement("SELECT uti,filename FROM representation WHERE entry_id=? ORDER BY item_order,id", [.text(id.uuidString)])
         defer { sqlite3_finalize(query) }
         var stored: URL?
         var referenced: URL?
-        while sqlite3_step(query) == SQLITE_ROW {
+        while try next(query) {
+            try Task.checkCancellation()
             let type = text(query, 0)
-            guard let url = assetURL(text(query, 1)) else { continue }
+            guard let url = assetURL(text(query, 1)) else { throw LibraryError.storage }
             if ClipboardFormats.rasterImages.contains(type) {
                 if stored == nil { stored = url }
-            } else if type == "public.file-url", referenced == nil {
-                referenced = url
-            }
+            } else if type == "public.file-url", referenced == nil { referenced = url }
         }
         return (stored, referenced)
     }
 
-    /// 路径必须是 UUID 文件名，拒绝数据库损坏导致的目录穿越。
     private func assetURL(_ name: String) -> URL? {
         guard UUID(uuidString: name) != nil else { return nil }
         return root?.appendingPathComponent("assets/\(name)")
     }
 
-    /// 启动或清空后回收未提交文件；缺失原始资产保留记录，复制时明确报错。
+    private func assetData(_ name: String, maximum: Int, expectedSize: Int? = nil) throws -> Data {
+        guard UUID(uuidString: name) != nil, maximum >= 0 else { throw LibraryError.missingContent }
+        let descriptor = openat(assetsDescriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { throw LibraryError.missingContent }
+        defer { Darwin.close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == getuid(), info.st_nlink == 1, info.st_size >= 0 else { throw LibraryError.missingContent }
+        if let expectedSize, info.st_size != Int64(expectedSize) { throw LibraryError.missingContent }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let data = try handle.read(upToCount: maximum) ?? Data()
+        if let expectedSize, data.count != expectedSize { throw LibraryError.missingContent }
+        return data
+    }
+
+    /// UUID 独占创建、0600 起始权限；未提交文件不可见，失败只回收本次创建的文件。
+    private func writeAsset(_ data: Data, name: String) throws {
+        let descriptor = openat(assetsDescriptor, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw LibraryError.storage }
+        defer { Darwin.close(descriptor) }
+        do {
+            try data.withUnsafeBytes { buffer in
+                var offset = 0
+                while offset < buffer.count {
+                    let count = Darwin.write(descriptor, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                    if count < 0, errno == EINTR { continue }
+                    guard count > 0 else { throw LibraryError.storage }
+                    offset += count
+                }
+            }
+            guard fsync(descriptor) == 0 else { throw LibraryError.storage }
+        } catch {
+            unlinkat(assetsDescriptor, name, 0)
+            throw error
+        }
+    }
+
+    private func unlinkAssets(_ names: [String]) {
+        for name in names where UUID(uuidString: name) != nil {
+            if unlinkat(assetsDescriptor, name, 0) != 0, errno != ENOENT {
+                logger.warning("Orphan asset removal deferred")
+            }
+        }
+    }
+
+    /// 完整验证引用扫描后才回收；只 unlink UUID 普通文件 / 链接，不递归删除目录或未知文件。
     private func recoverAssets() throws {
-        guard let root else { throw LibraryError.storage }
+        guard assetsDescriptor >= 0 else { throw LibraryError.storage }
         let query = try statement("SELECT filename FROM representation")
         var referenced: Set<String> = []
-        while sqlite3_step(query) == SQLITE_ROW { referenced.insert(text(query, 0)) }
-        sqlite3_finalize(query)
-        let directory = root.appendingPathComponent("assets")
-        for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
-            if !referenced.contains(file.lastPathComponent) { try FileManager.default.removeItem(at: file) }
+        do {
+            defer { sqlite3_finalize(query) }
+            while try next(query) {
+                let name = text(query, 0)
+                guard UUID(uuidString: name) != nil else { throw LibraryError.storage }
+                referenced.insert(name)
+            }
+        }
+        let duplicate = dup(assetsDescriptor)
+        guard duplicate >= 0 else { throw LibraryError.storage }
+        guard let directory = fdopendir(duplicate) else { Darwin.close(duplicate); throw LibraryError.storage }
+        defer { closedir(directory) }
+        // dup 共享目录位置，每次扫描前重置，否则清空后的扫描可能从 EOF 开始。
+        rewinddir(directory)
+        while true {
+            errno = 0
+            guard let item = readdir(directory) else {
+                guard errno == 0 else { throw LibraryError.storage }
+                break
+            }
+            let name = withUnsafePointer(to: &item.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+            }
+            guard UUID(uuidString: name) != nil else { continue }
+            if !referenced.contains(name) { unlinkAssets([name]); continue }
+            // 已有资产也收紧权限；不 chmod 链接、目录、其他所有者或多硬链接文件。
+            let descriptor = openat(assetsDescriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            if descriptor < 0 { continue }
+            var info = stat()
+            let regular = fstat(descriptor, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+            if regular, info.st_uid == getuid(), info.st_nlink == 1 {
+                let status = fchmod(descriptor, 0o600)
+                Darwin.close(descriptor)
+                guard status == 0 else { throw LibraryError.storage }
+            } else { Darwin.close(descriptor) }
         }
     }
 }

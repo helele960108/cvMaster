@@ -306,7 +306,7 @@ struct QuickPanelView: View {
                                 Button("加载更多") { library.loadMore() }
                                     .buttonStyle(PanelButtonStyle()).font(.caption).padding(8).disabled(library.loading)
                             } else if library.clips.count == StorageLimits.maximumLoaded {
-                                Text("已加载 300 条，请搜索缩小范围").font(.caption).foregroundStyle(.secondary)
+                                Text("已加载 \(StorageLimits.maximumLoaded) 条，请搜索缩小范围").font(.caption).foregroundStyle(.secondary)
                             }
                         }.padding(12)
                     }

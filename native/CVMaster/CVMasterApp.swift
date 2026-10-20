@@ -4,7 +4,7 @@
  * @since 2026-10-19
  */
 import AppKit
-@preconcurrency import ApplicationServices
+import ApplicationServices
 import Carbon
 import Combine
 import OSLog
@@ -43,12 +43,21 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
 
     /// 打开浮层前的外部应用，粘贴时只允许回到此进程，不向当前任意窗口发送按键。
     private var pasteApplication: NSRunningApplication?
-    /// 打开浮层前的可编辑焦点；不读取输入框的现有内容。
-    private var pasteElement: AXUIElement?
-    /// 即使目标延迟暴露输入节点，也必须在原窗口中重试，禁止回退到其他窗口。
-    private var pasteWindow: AXUIElement?
-    /// 菜单栏点击可能先激活本应用，保留最近的外部应用作为原输入位置的候选。
-    private var lastExternalApplication: NSRunningApplication?
+    /// 只保存 Sendable 身份标识；实际 AX 引用由专属串行后台队列独占。
+    private var pasteTarget: PasteTargetSnapshot?
+    private let pasteTargetWorker = PasteTargetWorker()
+    /// 同步消费激活 / 关闭事件；内容读取、焦点恢复和最终发送共用同一份请求身份。
+    private var pasteHandoff = PasteHandoffPolicy(
+        ownProcessIdentifier: ProcessInfo.processInfo.processIdentifier,
+        initiallyActiveProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier
+    )
+    private var focusGeneration: UInt64 { pasteHandoff.focusGeneration }
+    private var captureGeneration: UUID?
+    private var captureTask: Task<Void, Never>?
+    /// 剪贴板写入前完成深校验；同步检查只接受同一份准备结果。
+    private var preparedPasteTarget: UUID?
+    private var preparedFocusGeneration: UInt64?
+    private var preparedPasteDeadline: ContinuousClock.Instant?
     /// 使用 Combine 自动注销工作区通知，不建立键盘监听。
     private var activationSubscription: AnyCancellable?
     /// 快捷键变更后同步菜单栏提示，避免注册完成前后读到旧组合。
@@ -59,12 +68,14 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.current = self
         NSApp.setActivationPolicy(.accessory)
-        rememberExternalApplication()
         activationSubscription = NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                // AppKit 工作区通知通过主 RunLoop 投递，外部应用变更不跨线程访问 UI。
-                MainActor.assumeIsolated { self?.rememberExternalApplication() }
+            .sink { [weak self] notification in
+                // NSWorkspace 在主线程发通知；不再 receive(on:) 二次排队，避免 PID 先变、代数后变。
+                // 必须消费该事件的应用，而非稍后查询时已经再次改变的当前前台进程。
+                MainActor.assumeIsolated {
+                    let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                    self?.pasteHandoff.applicationActivated(application?.processIdentifier)
+                }
             }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
@@ -84,17 +95,25 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         popover.delegate = self
         library.validatePasteTarget = { [weak self] in
             guard let self else { throw LibraryError.pasteTargetUnavailable }
-            try self.validatePasteTarget()
+            do { try self.validatePasteTarget() }
+            catch {
+                self.presentPasteFailureIfSafe()
+                throw error
+            }
+        }
+        library.preparePasteTarget = { [weak self] in
+            guard let self else { throw LibraryError.pasteTargetUnavailable }
+            do { try await self.preparePasteTarget() }
+            catch {
+                self.presentPasteFailureIfSafe()
+                throw error
+            }
         }
         library.performPaste = { [weak self] in
             guard let self else { throw LibraryError.pasteTargetUnavailable }
             do { try await self.pasteToTarget() }
             catch {
-                // 已收起后才发生的失败重新展示列表，让错误反馈可见，不重复捕获目标。
-                if !self.popover.isShown, let button = self.statusItem?.button {
-                    self.library.panelOpened()
-                    self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-                }
+                self.presentPasteFailureIfSafe()
                 throw error
             }
         }
@@ -171,186 +190,219 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         return image
     }
 
-    /// 只在菜单栏图标下展示，不在屏幕中央额外创建一个窗口。
+    /// 先异步捕获原位置再展示浮层；捕获期间忽略重复热键，避免排队查询及焦点漂移。
     @objc func togglePopover() {
-        // 粘贴交接期间不能重新唤起搜索框，避免目标应用恢复前再次抢走键盘焦点。
-        guard !library.copying, let button = statusItem?.button else { return }
-        // 从系统设置返回或授权状态变化后，下次打开浮层立即使用最新状态。
+        guard !library.copying, captureGeneration == nil, statusItem?.button != nil else { return }
         library.refreshAccessibilityStatus()
         if popover.isShown { popover.performClose(nil); return }
-        capturePasteTarget()
-        library.resizePanel(to: library.panelHeight)
-        library.panelOpened()
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
-    }
-
-    /// 在搜索框取得焦点前保存外部输入位置；未授权时不读取其他应用的辅助功能树。
-    private func capturePasteTarget() {
-        rememberExternalApplication()
-        pasteApplication = lastExternalApplication
-        pasteElement = nil
-        pasteWindow = nil
-        guard AXIsProcessTrusted(), let application = pasteApplication,
-              application.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
-        let app = accessibilityApplication(application)
-        // Electron / Chromium 可延迟创建辅助功能树；主动启用手动辅助功能，不读写用户文本。
-        // 原生应用不支持此属性时忽略，仅在目标窗口恢复后继续做严格焦点检查。
-        _ = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        pasteWindow = accessibilityElement(app, attribute: kAXFocusedWindowAttribute)
-        pasteElement = focusedElement(in: application)
-        let hasWindow = pasteWindow != nil
-        let hasElement = pasteElement != nil
-        let editable = pasteElement.map(isEditable) ?? false
-        pasteLogger.notice("Paste target captured: window=\(hasWindow), element=\(hasElement), editable=\(editable)")
-    }
-
-    /// 只记住实际前台的外部进程，忽略本应用的搜索框、设置窗口和权限提示。
-    private func rememberExternalApplication() {
-        guard let application = NSWorkspace.shared.frontmostApplication,
-              application.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
-        lastExternalApplication = application
-    }
-
-    /// 设置短超时，第三方应用无响应时不长时间阻塞菜单栏主线程。
-    private func accessibilityApplication(_ application: NSRunningApplication) -> AXUIElement {
-        let app = AXUIElementCreateApplication(application.processIdentifier)
-        AXUIElementSetMessagingTimeout(app, 0.2)
-        return app
-    }
-
-    /// 仅读取指定的节点引用，不读取节点的文本值；错误码用于定位目标应用兼容性。
-    private func accessibilityElement(_ owner: AXUIElement, attribute: String) -> AXUIElement? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(owner, attribute as CFString, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
-            pasteLogger.debug("AX node lookup failed: attribute=\(attribute, privacy: .public), code=\(result.rawValue)")
-            return nil
+        let generation = UUID()
+        let originalFocusGeneration = focusGeneration
+        let application = NSWorkspace.shared.frontmostApplication
+        let originalPID = application?.processIdentifier
+        captureGeneration = generation
+        pasteApplication = nil
+        pasteTarget = nil
+        clearPreparedPasteTarget()
+        captureTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.captureGeneration == generation {
+                    self.captureGeneration = nil
+                    self.captureTask = nil
+                }
+            }
+            let target = await self.capturePasteTarget(application: application)
+            guard !Task.isCancelled, self.captureGeneration == generation,
+                  self.focusGeneration == originalFocusGeneration,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == originalPID,
+                  application?.isTerminated != true, !self.library.copying, !self.popover.isShown,
+                  let button = self.statusItem?.button else { return }
+            // 不重取窗口 / 输入框。未授权或捕获失败仍可浏览历史，但此次浮层没有可用粘贴目标。
+            self.pasteApplication = target == nil ? nil : application
+            self.pasteTarget = target
+            self.library.resizePanel(to: self.library.panelHeight)
+            self.library.panelOpened()
+            self.pasteHandoff.panelWillOpen(targetID: target?.id, processIdentifier: target?.processIdentifier,
+                                           frontmostProcessIdentifier: originalPID)
+            self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            self.popover.contentViewController?.view.window?.makeKey()
         }
-        return (value as! AXUIElement)
     }
 
-    /// 优先使用目标应用焦点，必要时回退系统焦点，但必须核验节点所属进程。
-    private func focusedElement(in application: NSRunningApplication) -> AXUIElement? {
-        let app = accessibilityApplication(application)
-        if let element = accessibilityElement(app, attribute: kAXFocusedUIElementAttribute) { return element }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
-              let element = accessibilityElement(AXUIElementCreateSystemWide(), attribute: kAXFocusedUIElementAttribute) else { return nil }
-        var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success, pid == application.processIdentifier else { return nil }
-        return element
+    /// 不使用“最近外部应用”猜测原焦点；目标已不在前台时只能失败，不在浮层显示后补抓节点。
+    private func capturePasteTarget(application: NSRunningApplication?) async -> PasteTargetSnapshot? {
+        guard AXIsProcessTrusted(), let application, !application.isTerminated,
+              application.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return nil }
+        let target = await pasteTargetWorker.capture(processIdentifier: application.processIdentifier,
+                                                     deadline: .now.advanced(by: .milliseconds(900)))
+        pasteLogger.notice("Paste target capture completed: available=\(target != nil)")
+        return target
     }
 
-    /// 粘贴使用快捷键，不要求直接修改 AXValue；网页和 Electron 编辑器可能只允许修改选区。
-    /// 已禁用的节点拒绝操作，非文本角色仍须暴露可写选区，不向普通按钮或容器发送内容。
-    private func isEditable(_ element: AXUIElement) -> Bool {
-        var enabled: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabled) == .success,
-           let enabled = enabled as? Bool, !enabled { return false }
-        for attribute in [kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute] {
-            var settable = DarwinBoolean(false)
-            if AXUIElementIsAttributeSettable(element, attribute as CFString, &settable) == .success,
-               settable.boolValue { return true }
-        }
-        var role: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
-              let role = role as? String else { return false }
-        // 标准文本角色支持键盘粘贴，即使不支持程序直接设置 AXValue。
-        let editable = [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role)
-        if !editable { pasteLogger.debug("AX focus is not editable: role=\(role, privacy: .public)") }
-        return editable
-    }
-
-    /// 在改写剪贴板之前检查权限；首次缺少权限时由共享状态触发一次系统提示。
-    /// 不缓存授权结果，用户在系统设置授权后，下次操作立即重新检查真实状态。
-    private func validatePasteTarget() throws {
+    /// MainActor 只检查本地状态与授权，不同步调用其他进程的 AX 树。
+    private func requireSavedPasteTarget(clipboardWritten: Bool = false) throws -> (NSRunningApplication, PasteTargetSnapshot) {
         guard AXIsProcessTrusted() else {
-            library.promptForAccessibilityIfNeeded()
+            if !clipboardWritten { library.promptForAccessibilityIfNeeded() }
             pasteLogger.error("Paste rejected: accessibility permission missing for current signed build")
-            throw LibraryError.pastePermissionRequired
+            // 仅写入前可以声称剪贴板未改变，写入后统一提示手动粘贴。
+            throw clipboardWritten ? LibraryError.pasteTargetUnavailable : LibraryError.pastePermissionRequired
         }
-        guard let application = pasteApplication, !application.isTerminated,
+        guard let application = pasteApplication, !application.isTerminated, let target = pasteTarget,
+              target.processIdentifier == application.processIdentifier,
               application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
-              pasteWindow != nil || pasteElement != nil else {
-            pasteLogger.error("Paste rejected: original application or window unavailable")
+              captureGeneration == nil else {
+            pasteLogger.error("Paste rejected: original application or focus unavailable")
             throw LibraryError.pasteTargetUnavailable
+        }
+        return (application, target)
+    }
+
+    /// 初次同步检查固定用户请求，内容 await 后不能采纳新焦点；最终同步检查只接受同一准备结果。
+    private func validatePasteTarget() throws {
+        let (application, target) = try requireSavedPasteTarget()
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if library.copying {
+            guard preparedPasteTarget == target.id, preparedFocusGeneration == focusGeneration,
+                  pasteHandoff.isPrepared(targetID: target.id, frontmostProcessIdentifier: frontmost),
+                  let deadline = preparedPasteDeadline, ContinuousClock.now < deadline,
+                  targetIsReady(application) else { throw LibraryError.pasteTargetUnavailable }
+        } else {
+            clearPreparedPasteTarget()
+            guard pasteHandoff.beginRequest(targetID: target.id, processIdentifier: target.processIdentifier,
+                                            frontmostProcessIdentifier: frontmost, panelIsShown: popover.isShown) else {
+                throw LibraryError.pasteTargetUnavailable
+            }
         }
     }
 
-    /// 收起浮层后恢复原应用 / 原窗口并发送标准 ⌘V；可读取原输入节点时额外核验节点一致。
-    /// 部分应用不暴露 AX 输入节点，但仍支持系统粘贴，此时由原窗口的 responder 处理命令。
-    /// 不选择控件、不点击坐标、不提交消息；窗口变化、权限撤销或应用退出时终止。
-    private func pasteToTarget() async throws {
-        try validatePasteTarget()
-        guard let application = pasteApplication else { throw LibraryError.pasteTargetUnavailable }
-        let originalElement = pasteElement
-        let originalWindow = pasteWindow
-        // 明确得到非编辑节点时不能退回当前任意输入框；仅节点缺失时允许在原窗口中重试。
-        if let originalElement, !isEditable(originalElement) {
-            pasteLogger.error("Paste rejected: captured node is not editable")
+    private func targetIsReady(_ application: NSRunningApplication) -> Bool {
+        let modifiers = CGEventSource.flagsState(.combinedSessionState)
+            .intersection([.maskCommand, .maskAlternate, .maskControl, .maskShift])
+        return !popover.isShown && !NSApp.isActive && !application.isTerminated && modifiers.isEmpty
+            && NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier
+    }
+
+    private func clearPreparedPasteTarget() {
+        preparedPasteTarget = nil
+        preparedFocusGeneration = nil
+        preparedPasteDeadline = nil
+    }
+
+    /// 在剪贴板覆盖之前收起浮层、恢复原进程并验证原窗口 / 输入身份；失败不写剪贴板。
+    private func preparePasteTarget() async throws {
+        clearPreparedPasteTarget()
+        let (application, target) = try requireSavedPasteTarget()
+        // 先确认最初点击时的请求仍有效。此处之前禁止 close / deactivate / activate，
+        // 否则内容读取期间用户转到 C，会被迟到的准备操作强行拉回原应用 A。
+        guard pasteHandoff.beginPreparation(targetID: target.id,
+                                           frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                                           ownApplicationIsActive: NSApp.isActive, panelIsShown: popover.isShown) else {
             throw LibraryError.pasteTargetUnavailable
         }
-        // 关闭动画会延后 key window 归还，粘贴时直接关闭，避免与焦点恢复竞争。
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(2500))
         let animated = popover.animates
-        let panelWindow = popover.contentViewController?.view.window
-        // 只解除搜索框的 first responder，浮层可见性由 NSPopover 管理。
-        // 禁止直接 orderOut / resignKey 宿主窗口，否则会使 isShown 与真实窗口状态失步。
-        panelWindow?.makeFirstResponder(nil)
+        popover.contentViewController?.view.window?.makeFirstResponder(nil)
         popover.animates = false
-        // 用户已明确执行粘贴，直接关闭而非可被 field editor 拒绝的 performClose 请求。
+        // policy 中的 intentionalClosePending 只允许本次关闭事件；其他关闭均使请求失效。
         popover.close()
         popover.animates = animated
-        NSApp.deactivate()
-        let activated = application.activate(options: [])
-        pasteLogger.notice("Paste activation requested: accepted=\(activated)")
-        // 仅保留最后一个阻塞条件，不记录窗口标题、聊天对象或输入内容。
-        var blockedStage = "activation"
-        // 最长等待 2.5 秒；少数应用切换前台或释放修饰键会跨越多帧。
-        for _ in 0..<100 {
-            try await Task.sleep(for: .milliseconds(25))
-            let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            let modifiers = CGEventSource.flagsState(.combinedSessionState)
-                .intersection([.maskCommand, .maskAlternate, .maskControl, .maskShift])
-            guard frontmost == application.processIdentifier else { blockedStage = "activation"; continue }
-            // 必须确认本应用的浮层已隐藏且不再持有 key window，避免搜索框成为粘贴接收方。
-            guard !popover.isShown else { blockedStage = "popover-close"; continue }
-            // 定向进程投递不依赖已隐藏宿主窗口可能滞后的 isKeyWindow 缓存。
-            guard !NSApp.isActive else { blockedStage = "application-deactivation"; continue }
-            guard modifiers.isEmpty else { blockedStage = "modifier-release"; continue }
-            guard AXIsProcessTrusted(), !application.isTerminated else {
-                pasteLogger.error("Paste stopped: permission revoked or target exited")
-                throw LibraryError.pasteTargetUnavailable
-            }
-            // 未捕获到输入节点时仅允许在原窗口重试，绝不向同一应用的其他窗口回退。
-            let app = accessibilityApplication(application)
-            if let originalWindow {
-                guard let window = accessibilityElement(app, attribute: kAXFocusedWindowAttribute),
-                      CFEqual(window, originalWindow) else { blockedStage = "original-window"; continue }
-            }
-            if let originalElement {
-                guard let focused = focusedElement(in: application), CFEqual(focused, originalElement),
-                      isEditable(focused) else { blockedStage = "original-input"; continue }
-            } else {
-                // 缺少 AX 输入节点并不表示不存在光标；必须有原窗口作为边界，交由原 responder 粘贴。
-                guard originalWindow != nil else { throw LibraryError.pasteTargetUnavailable }
-            }
-            guard let source = CGEventSource(stateID: .privateState),
-                  let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true),
-                  let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false) else {
-                throw LibraryError.pasteTargetUnavailable
-            }
-            down.flags = .maskCommand
-            up.flags = .maskCommand
-            // 定向投递到打开列表前保存的外部进程，不使用全局 HID 路由。
-            // 即使系统前台状态与 key window 交接存在时差，事件也不能落入 cvMaster 搜索框。
-            down.postToPid(application.processIdentifier)
-            up.postToPid(application.processIdentifier)
-            let checkedInputNode = originalElement != nil
-            pasteLogger.notice("Paste shortcut dispatched directly to saved external process: original window verified, input node checked=\(checkedInputNode)")
-            return
+        guard pasteHandoff.preparationIsValid(targetID: target.id,
+                                              frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier) else {
+            throw LibraryError.pasteTargetUnavailable
         }
-        pasteLogger.error("Paste timed out: stage=\(blockedStage, privacy: .public)")
+        NSApp.deactivate()
+        guard pasteHandoff.preparationIsValid(targetID: target.id,
+                                              frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier) else {
+            throw LibraryError.pasteTargetUnavailable
+        }
+        if !pasteHandoff.restorationAcknowledged(targetID: target.id) {
+            let activated = application.activate(options: [])
+            pasteLogger.notice("Paste activation requested: accepted=\(activated)")
+            guard activated else { throw LibraryError.pasteTargetUnavailable }
+        }
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            let (_, currentTarget) = try requireSavedPasteTarget()
+            guard currentTarget.id == target.id,
+                  pasteHandoff.preparationIsValid(targetID: target.id,
+                                                  frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier) else {
+                throw LibraryError.pasteTargetUnavailable
+            }
+            // 恢复代数只在实际预期激活通知确认后冻结；PID 已变化但通知未到时继续等待。
+            if targetIsReady(application), pasteHandoff.restorationAcknowledged(targetID: target.id) {
+                let restoredGeneration = focusGeneration
+                let verified = await pasteTargetWorker.validate(target, deadline: deadline)
+                try Task.checkCancellation()
+                guard verified, ContinuousClock.now < deadline,
+                      restoredGeneration == focusGeneration, pasteTarget?.id == target.id,
+                      pasteHandoff.preparationIsValid(targetID: target.id,
+                                                      frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier),
+                      AXIsProcessTrusted(), targetIsReady(application),
+                      pasteHandoff.markPrepared(targetID: target.id) else {
+                    throw LibraryError.pasteTargetUnavailable
+                }
+                preparedPasteTarget = target.id
+                preparedFocusGeneration = restoredGeneration
+                preparedPasteDeadline = min(deadline, .now.advanced(by: .milliseconds(300)))
+                try validatePasteTarget()
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        pasteLogger.error("Paste preparation deadline reached")
         throw LibraryError.pasteTargetUnavailable
+    }
+
+    /// 写入完成后再次异步校验同一份引用；最后本地检查和定向投递之间不再 await。
+    private func pasteToTarget() async throws {
+        defer {
+            clearPreparedPasteTarget()
+            pasteHandoff.finishRequest()
+        }
+        let (application, target) = try requireSavedPasteTarget(clipboardWritten: true)
+        guard preparedPasteTarget == target.id, preparedFocusGeneration == focusGeneration,
+              pasteHandoff.isPrepared(targetID: target.id,
+                                      frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier),
+              let preparedDeadline = preparedPasteDeadline, ContinuousClock.now < preparedDeadline,
+              targetIsReady(application) else { throw LibraryError.pasteTargetUnavailable }
+        let generation = focusGeneration
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(900))
+        let verified = await pasteTargetWorker.validate(target, deadline: deadline)
+        try Task.checkCancellation()
+        guard verified, ContinuousClock.now < deadline, generation == focusGeneration,
+              pasteTarget?.id == target.id, preparedPasteTarget == target.id,
+              pasteHandoff.isPrepared(targetID: target.id,
+                                      frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier),
+              AXIsProcessTrusted(), targetIsReady(application) else { throw LibraryError.pasteTargetUnavailable }
+        guard let source = CGEventSource(stateID: .privateState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false) else {
+            throw LibraryError.pasteTargetUnavailable
+        }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        // 只定向保存的 PID；不使用全局 HID 路由，也不选择控件、点击坐标或提交消息。
+        // AX 校验与系统按键派发无法原子绑定；外部应用仍可能在两者之间自行改变焦点。
+        guard AXIsProcessTrusted(), targetIsReady(application),
+              pasteHandoff.isPrepared(targetID: target.id,
+                                      frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier) else {
+            throw LibraryError.pasteTargetUnavailable
+        }
+        down.postToPid(application.processIdentifier)
+        up.postToPid(application.processIdentifier)
+        pasteLogger.notice("Paste shortcut dispatched to saved process: original window verified, input node checked=\(target.hasInputNode)")
+    }
+
+    /// 失败不补抓 AX 引用；仅仍停留在原进程或本应用时显示说明，不抢走其他应用的焦点。
+    private func presentPasteFailureIfSafe() {
+        clearPreparedPasteTarget()
+        pasteHandoff.finishRequest()
+        guard pasteHandoff.mayPresentFailure, let application = pasteApplication,
+              let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              frontmost == application.processIdentifier || frontmost == ProcessInfo.processInfo.processIdentifier,
+              !popover.isShown, let button = statusItem?.button else { return }
+        library.panelOpened()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 
     /// 安装一次热键事件处理；之后只更换注册组合，不重复安装 handler。
@@ -433,7 +485,10 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
             : "cvMaster · 快捷键不可用，请点击图标"
     }
 
-    func popoverDidClose(_ notification: Notification) { library.panelClosed() }
+    func popoverDidClose(_ notification: Notification) {
+        pasteHandoff.panelDidClose()
+        library.panelClosed()
+    }
 
     /// 从系统设置返回或其他方式重新激活应用时，刷新辅助功能与登录项状态。
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -442,6 +497,10 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        captureGeneration = nil
+        captureTask?.cancel()
+        captureTask = nil
+        clearPreparedPasteTarget()
         library.monitor?.stop()
         unregisterHotKey()
         if let eventHandler { RemoveEventHandler(eventHandler) }

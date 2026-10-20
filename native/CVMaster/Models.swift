@@ -40,6 +40,28 @@ enum AppAppearance: String, CaseIterable, Identifiable {
 enum ClipKind: String, CaseIterable, Identifiable, Sendable {
     case text = "文本", link = "链接", image = "图片", file = "文件"
     var id: String { rawValue }
+
+    /// 持久化键与显示文案分离；修改中文名称不需要迁移历史内容。
+    var storageValue: String {
+        switch self {
+        case .text: "text"
+        case .link: "link"
+        case .image: "image"
+        case .file: "file"
+        }
+    }
+
+    static func fromStorageValue(_ value: String) -> ClipKind {
+        switch value {
+        case "text", "文本": .text
+        case "link", "链接": .link
+        case "image", "图片": .image
+        case "file", "文件": .file
+        // 未知分类仍允许查看和恢复原始表示，不因一条异常记录阻断整页。
+        default: .text
+        }
+    }
+
     /// SF Symbols 系统符号，搭配类型名称提供可访问语义。
     var symbol: String {
         switch self {
@@ -136,7 +158,7 @@ struct ClipCapture: Sendable {
     let kind: ClipKind
     let title: String
     let excerpt: String
-    /// 有限的可搜索纯文本，不执行 HTML / RTF 内容。
+    /// 有限的可搜索纯文本；RTF-only 仅在后台按解析预算补充，不执行 HTML。
     let searchText: String
     let source: String
     /// 采集时推断的来源 Bundle ID；旧记录为空，不按同名应用猜测身份。
@@ -183,7 +205,7 @@ enum StorageLimits {
 
 /// 面向用户的可控失败提示；日志不输出正文、路径或原始 SQL 参数。
 enum LibraryError: LocalizedError {
-    case storage, capacity, unsupported, missingContent, unavailableFile, nameConflict, plainTextUnavailable
+    case storage, capacity, unsupported, missingContent, unavailableFile, nameConflict, plainTextUnavailable, richTextTooLarge
     /// 自动粘贴授权缺失，或原输入位置不可用；与内容 / 存储错误分别提示。
     case pastePermissionRequired, pasteTargetUnavailable
     var errorDescription: String? {
@@ -195,6 +217,7 @@ enum LibraryError: LocalizedError {
         case .unsupported: "内容格式暂不支持，或超过单条保存限额。"
         case .missingContent: "内容文件不可用，无法再次复制。"
         case .unavailableFile: "原文件已移动、删除或无权访问，无法复制文件引用。"
+        case .richTextTooLarge: "RTF 超过 256 KB 纯文本转换预算，未改变剪贴板；仍可使用普通粘贴保留原格式。"
         case .plainTextUnavailable: "此记录没有可用的纯文本或 RTF 表示，无法移除格式；原始剪贴板未改变。"
         case .nameConflict: "分组名称为空、过长或已存在。"
         }

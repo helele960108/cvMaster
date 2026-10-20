@@ -67,7 +67,12 @@ final class ClipboardLibrary: ObservableObject {
     @Published var recordingEnabled = UserDefaults.standard.bool(forKey: "recordingEnabled") {
         didSet { UserDefaults.standard.set(recordingEnabled, forKey: "recordingEnabled"); monitor?.resetBaseline() }
     }
-    @Published var paused = false { didSet { monitor?.resetBaseline() } }
+    @Published var paused = UserDefaults.standard.bool(forKey: "recordingPaused") {
+        didSet {
+            UserDefaults.standard.set(paused, forKey: "recordingPaused")
+            monitor?.resetBaseline()
+        }
+    }
     /// 0 表示不按时间清理；缺省仍为 30 天，容量上限始终生效。
     @Published var retention = (UserDefaults.standard.object(forKey: "retentionDays") == nil
         ? 30
@@ -96,13 +101,17 @@ final class ClipboardLibrary: ObservableObject {
     @Published private(set) var previewLoading = false
     /// 写入剪贴板前校验原输入位置与辅助功能权限，失败时保留原剪贴板。
     var validatePasteTarget: (() throws -> Void)?
-    /// 写入完成后由原生容器收起浮层、恢复焦点并发送粘贴；等待期间阻止重复操作。
+    /// 恢复原窗口并异步核验 AX 身份；成功后才允许改写剪贴板。
+    var preparePasteTarget: (() async throws -> Void)?
+    /// 写入完成后重新核验目标并发送粘贴；等待期间阻止重复操作。
     var performPaste: (() async throws -> Void)?
     /// 生命周期由应用代理持有；监测器反向弱引用本对象。
     var monitor: ClipboardMonitor?
     private let store = HistoryStore()
     private let logger = Logger(subsystem: "local.helele.cvmaster", category: "library")
     private var searchTask: Task<Void, Never>?
+    /// 清空等待已接收的写入结束，避免尚未进入存储 actor 的旧快照在清空后落盘。
+    private var captureTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     /// 分组目录单独刷新，不被搜索防抖任务取消，也不接收历史页的旧目录。
     private var groupsTask: Task<Void, Never>?
@@ -268,7 +277,7 @@ final class ClipboardLibrary: ObservableObject {
         limit = StorageLimits.pageSize
     }
 
-    /// 保留至多一个待执行查询；中文子串用 SQLite LIKE，避免主线程扫描全库。
+    /// 防抖并拒绝旧结果；子串匹配与可用索引由存储层统一选择。
     func scheduleSearch(debounce: Bool = false, resetLimit: Bool = true) {
         searchVersion += 1
         let version = searchVersion
@@ -337,17 +346,19 @@ final class ClipboardLibrary: ObservableObject {
 
     /// 主线程只移交有界快照；哈希、去重、写文件和关系操作都在 actor 上执行。
     func accept(_ capture: ClipCapture) {
-        guard !captureBusy, !clearing else { skippedChange(); return }
+        guard recordingEnabled, !paused, !captureBusy, !clearing else { skippedChange(); return }
         captureBusy = true
         let days = retention
-        Task { [weak self, store] in
+        captureTask = Task { [weak self, store] in
             do {
                 try await store.save(capture, retention: days)
                 guard let self else { return }
                 self.captureBusy = false
+                self.captureTask = nil
                 if self.panelVisible { self.scheduleSearch() }
             } catch {
                 self?.captureBusy = false
+                self?.captureTask = nil
                 self?.report(error)
             }
         }
@@ -364,7 +375,7 @@ final class ClipboardLibrary: ObservableObject {
         guard !copying, !loading else { return }
         guard !plainText || clip.kind == .text || clip.kind == .link else { return }
         do {
-            guard let validatePasteTarget, performPaste != nil else { throw LibraryError.pasteTargetUnavailable }
+            guard let validatePasteTarget, preparePasteTarget != nil, performPaste != nil else { throw LibraryError.pasteTargetUnavailable }
             try validatePasteTarget()
         } catch { report(error); return }
         copying = true
@@ -383,6 +394,11 @@ final class ClipboardLibrary: ObservableObject {
                     }
                     items[representation.item] = item
                 }
+                guard let preparePasteTarget = self.preparePasteTarget else { throw LibraryError.pasteTargetUnavailable }
+                try await preparePasteTarget()
+                // 深度检查包含挂起点，写入前再次检查权限与交接状态，中间不再 await。
+                guard let validatePasteTarget = self.validatePasteTarget else { throw LibraryError.pasteTargetUnavailable }
+                try validatePasteTarget()
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()
                 guard pasteboard.writeObjects(items.keys.sorted().compactMap { items[$0] }) else {
@@ -476,7 +492,9 @@ final class ClipboardLibrary: ObservableObject {
     private func performClear(before cutoff: Date?) {
         guard !clearing else { return }
         clearing = true
+        let pendingCapture = captureTask
         Task { [weak self, store] in
+            await pendingCapture?.value
             do {
                 let removed: Int
                 if let cutoff {
