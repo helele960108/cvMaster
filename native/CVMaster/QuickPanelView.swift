@@ -182,7 +182,7 @@ struct QuickPanelView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("自动粘贴需要辅助功能权限")
                     .font(.caption.weight(.semibold))
-                Text("授权后，回车或双击可直接粘贴到原输入位置。")
+                Text("授权后，回车或双击可直接粘贴到当前激活的 APP。")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -335,7 +335,7 @@ struct QuickPanelView: View {
             }
         )
         .disabled(library.copying || library.loading)
-        .help("单击选中，双击粘贴到原输入位置；悬停查看预览")
+        .help("单击选中，双击粘贴到当前激活的 APP；悬停查看预览")
         // 每行只暴露一条合并后的语义，避免图片、来源和类型子元素重复朗读。
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel(for: clip))
@@ -367,7 +367,7 @@ struct QuickPanelView: View {
             if clip.kind == .text || clip.kind == .link {
                 Button("粘贴为纯文本", systemImage: "textformat") { library.paste(clip, plainText: true) }
                     .disabled(library.copying || library.loading)
-                    .help("移除格式后粘贴到原输入位置")
+                    .help("移除格式后粘贴到当前激活的 APP")
             }
             Button(clip.pinned ? "取消置顶" : "置顶", systemImage: "pin") { library.setPinned(clip) }
             Menu("加入分组") {

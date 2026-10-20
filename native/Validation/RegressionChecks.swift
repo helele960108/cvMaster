@@ -1,5 +1,5 @@
 /*
- * Standalone, synthetic-only checks for production storage and thumbnail code.
+ * Standalone, synthetic-only checks for production storage, thumbnails and pure policies.
  * No application lifecycle, clipboard monitor/library, XCTest, or real user database is loaded.
  * author: helele
  * since: 2026-10-20
@@ -142,7 +142,8 @@ private struct RegressionChecks {
                 ("clear retains groups and external referenced files", clearing),
                 ("thumbnail deduplication, deadline, cancellation and worker cap", thumbnails),
                 ("pure privacy gate and per-item capture budgets", capturePolicy),
-                ("pure paste handoff request binding and focus transitions", pasteHandoff)
+                ("pure paste handoff request binding and focus transitions", pasteHandoff),
+                ("pure paste focus restoration single-use permits and cancellation", pasteFocusRestoration)
             ]
             for (index, check) in checks.enumerated() {
                 let start = DispatchTime.now().uptimeNanoseconds
@@ -969,6 +970,173 @@ private struct RegressionChecks {
         var noPanel = PasteHandoffPolicy(ownProcessIdentifier: own, initiallyActiveProcessIdentifier: original)
         try require(!noPanel.beginRequest(targetID: target, processIdentifier: original,
                                           frontmostProcessIdentifier: original, panelIsShown: true), "Request started without a captured panel target")
+    }
+
+    /// Only synthetic identities and observations enter this suite; no AX or clipboard API is loaded.
+    private static func pasteFocusRestoration(_: URL) async throws {
+        let target = UUID(), otherTarget = UUID()
+        let now = ContinuousClock.now
+        let deadline = now.advanced(by: .seconds(1))
+        let observations: [PasteFocusObservation] = [.original, .missingInput, .originalInputContainer,
+                                                     .differentInput, .differentWindow]
+
+        func request(hasSavedInput: Bool = true) -> PasteFocusRestorationRequest {
+            PasteFocusRestorationRequest(targetID: target, hasSavedInput: hasSavedInput, deadline: deadline)
+        }
+
+        func requireRejected(_ request: PasteFocusRestorationRequest, _ context: String,
+                             at instant: ContinuousClock.Instant) throws {
+            try require(!request.isValid(now: instant), "\(context) retained a valid restoration permit")
+            for _ in 0..<2 {
+                for observation in observations {
+                    try require(request.action(for: observation, targetID: target, now: instant) == .reject,
+                                "\(context) revived when the original target/focus returned")
+                }
+            }
+        }
+
+        let original = request()
+        try require(original.isValid(now: now), "Fresh focus request was invalid")
+        for _ in 0..<4 {
+            try require(original.action(for: .original, targetID: target, now: now) == .ready,
+                        "Original input requested restoration instead of being immediately ready")
+        }
+        try require(original.action(for: .missingInput, targetID: target, now: now) == .restoreSavedInput,
+                    "Readiness incorrectly consumed the unused restoration permit")
+
+        for lostFocus in [PasteFocusObservation.missingInput, .originalInputContainer] {
+            let recovering = request()
+            try require(recovering.action(for: lostFocus, targetID: target, now: now) == .restoreSavedInput,
+                        "Recoverable original-window focus loss was not granted one restoration")
+            for _ in 0..<4 {
+                for observation in [PasteFocusObservation.missingInput, .originalInputContainer] {
+                    try require(recovering.action(for: observation, targetID: target, now: now) == .wait,
+                                "Repeated or alternating focus loss issued another restoration")
+                }
+            }
+            try require(recovering.action(for: .original, targetID: target, now: now) == .ready,
+                        "Restored original input did not become ready")
+            try require(recovering.action(for: lostFocus, targetID: target, now: now) == .wait,
+                        "Returning to original input reset the per-request restoration budget")
+            try require(recovering.action(for: .original, targetID: target, now: now) == .ready
+                        && recovering.isValid(now: now), "Waiting invalidated an otherwise unchanged original target")
+        }
+
+        // Production maps (saved input: none, current input: none) to .original, not .missingInput.
+        let noInput = request(hasSavedInput: false)
+        try require(noInput.action(for: .original, targetID: target, now: now) == .ready,
+                    "Stable original window without an exposed input node could not become ready")
+        for lostFocus in [PasteFocusObservation.missingInput, .originalInputContainer] {
+            let unavailable = request(hasSavedInput: false)
+            try require(unavailable.action(for: lostFocus, targetID: target, now: now) == .reject,
+                        "Request without a saved input node was allowed to restore focus")
+            try requireRejected(unavailable, "Missing saved input", at: now)
+        }
+
+        // Cancellation (including production error handling) and identity changes permanently revoke this request.
+        for interruption in ["cancel", "deadline", "wrong-target", "different-input", "different-window"] {
+            for restorationAlreadyGranted in [false, true] {
+                let interrupted = request()
+                if restorationAlreadyGranted {
+                    try require(interrupted.action(for: .missingInput, targetID: target, now: now) == .restoreSavedInput,
+                                "Interruption fixture did not obtain its initial restoration permit")
+                }
+                let rejectedAt: ContinuousClock.Instant
+                switch interruption {
+                case "cancel":
+                    interrupted.cancel()
+                    interrupted.cancel() // Idempotent, including cancellation before any restoration is granted.
+                    rejectedAt = now
+                case "deadline":
+                    try require(interrupted.isValid(now: deadline.advanced(by: .nanoseconds(-1)))
+                                && interrupted.action(for: .original, targetID: target,
+                                                      now: deadline.advanced(by: .nanoseconds(-1))) == .ready,
+                                "Focus request expired before its exact deadline")
+                    try require(interrupted.action(for: .original, targetID: target, now: deadline) == .reject,
+                                "Focus request accepted its inclusive expiration boundary")
+                    rejectedAt = deadline.advanced(by: .nanoseconds(1))
+                case "wrong-target":
+                    try require(interrupted.action(for: .original, targetID: otherTarget, now: now) == .reject,
+                                "Focus request accepted a different target identity")
+                    rejectedAt = now
+                default:
+                    let observation: PasteFocusObservation = interruption == "different-input" ? .differentInput : .differentWindow
+                    try require(interrupted.action(for: observation, targetID: target, now: now) == .reject,
+                                "Focus request accepted a different input or window")
+                    rejectedAt = now
+                }
+                try requireRejected(interrupted, "\(interruption), restoration granted=\(restorationAlreadyGranted)", at: rejectedAt)
+
+                let fresh = request()
+                try require(fresh.action(for: .original, targetID: target, now: now) == .ready
+                            && fresh.action(for: .missingInput, targetID: target, now: now) == .restoreSavedInput
+                            && fresh.action(for: .originalInputContainer, targetID: target, now: now) == .wait,
+                            "\(interruption) leaked cancellation or a spent permit into a new request for the same target")
+                try requireRejected(interrupted, "Old request after independent new request", at: rejectedAt)
+            }
+        }
+
+        // Child tasks race the real production lock, not a serialized synthetic replacement.
+        let callers = 64
+        for _ in 0..<8 {
+            let concurrent = request()
+            let counts = await withTaskGroup(of: (restore: Bool, wait: Bool).self) { group in
+                for index in 0..<callers {
+                    let observation: PasteFocusObservation = index.isMultiple(of: 2) ? .missingInput : .originalInputContainer
+                    group.addTask {
+                        let action = concurrent.action(for: observation, targetID: target, now: now)
+                        return (action == .restoreSavedInput, action == .wait)
+                    }
+                }
+                var restores = 0, waits = 0
+                for await result in group {
+                    if result.restore { restores += 1 }
+                    if result.wait { waits += 1 }
+                }
+                return (restores, waits)
+            }
+            try require(counts.0 == 1 && counts.1 == callers - 1,
+                        "Concurrent focus checks issued multiple restorations or rejected an unchanged target")
+            concurrent.cancel()
+            let rejected = await withTaskGroup(of: Bool.self) { group in
+                for index in 0..<callers {
+                    let observation = observations[index % observations.count]
+                    group.addTask {
+                        concurrent.action(for: observation, targetID: target, now: now) == .reject
+                            && !concurrent.isValid(now: now)
+                    }
+                }
+                var allRejected = true
+                for await result in group { allRejected = allRejected && result }
+                return allRejected
+            }
+            try require(rejected, "A concurrent call started a new restoration after cancellation returned")
+
+            let racingCancellation = request()
+            let cancellationCounts = await withTaskGroup(of: (restore: Bool, revoked: Bool).self) { group in
+                for index in 0..<callers {
+                    let observation: PasteFocusObservation = index.isMultiple(of: 2) ? .missingInput : .originalInputContainer
+                    group.addTask {
+                        let action = racingCancellation.action(for: observation, targetID: target, now: now)
+                        racingCancellation.cancel()
+                        // A granted action is not permission to start a later setter after synchronous cancellation.
+                        let revoked = !racingCancellation.isValid(now: now)
+                            && racingCancellation.action(for: observation, targetID: target, now: now) == .reject
+                            && racingCancellation.action(for: .original, targetID: target, now: now) == .reject
+                        return (action == .restoreSavedInput, revoked)
+                    }
+                }
+                var restores = 0, allRevoked = true
+                for await result in group {
+                    if result.restore { restores += 1 }
+                    allRevoked = allRevoked && result.revoked
+                }
+                return (restores, allRevoked)
+            }
+            try require(cancellationCounts.0 == 1 && cancellationCounts.1,
+                        "Racing cancellation allowed a duplicate restoration or a post-cancel permission")
+            try requireRejected(racingCancellation, "Concurrent action/cancel race", at: now)
+        }
     }
 
     private static func milliseconds(since start: UInt64) -> Double {

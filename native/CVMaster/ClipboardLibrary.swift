@@ -99,9 +99,9 @@ final class ClipboardLibrary: ObservableObject {
     @Published private(set) var copying = false
     @Published private(set) var preview: ClipPreview?
     @Published private(set) var previewLoading = false
-    /// 写入剪贴板前校验原输入位置与辅助功能权限，失败时保留原剪贴板。
+    /// 写入剪贴板前校验当前激活的 APP 与辅助功能权限，失败时保留原剪贴板。
     var validatePasteTarget: (() throws -> Void)?
-    /// 恢复原窗口并异步核验 AX 身份；成功后才允许改写剪贴板。
+    /// 关闭列表并确认目标 APP 稳定激活；成功后才允许改写剪贴板。
     var preparePasteTarget: (() async throws -> Void)?
     /// 写入完成后重新核验目标并发送粘贴；等待期间阻止重复操作。
     var performPaste: (() async throws -> Void)?

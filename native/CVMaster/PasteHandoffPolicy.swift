@@ -85,6 +85,8 @@ struct PasteHandoffPolicy {
     }
 
     mutating func panelDidClose() {
+        // 主动关闭的同步确认与 delegate 通知可先后抵达，只消费一次。
+        guard panelVisible else { return }
         dismissalGeneration &+= 1
         panelVisible = false
         if var request, request.intentionalClosePending {
@@ -149,6 +151,20 @@ struct PasteHandoffPolicy {
             invalidate()
             return false
         }
+        return true
+    }
+
+    /// 当前激活应用模式：调用方已确认目标稳定激活且修饰键释放，不要求重复激活通知。
+    /// 只承认既有请求、原进程及主动关闭；代数不符或第三方切换后绝不能重新收养请求。
+    mutating func confirmActiveTarget(targetID: UUID, frontmostProcessIdentifier: Int32?,
+                                      targetIsActive: Bool) -> Bool {
+        guard var request, request.targetID == targetID, request.closeAcknowledged,
+              epochsMatch(request), case .restoring = request.phase,
+              targetIsActive, frontmostProcessIdentifier == request.processIdentifier else { return false }
+        request.acceptedFocusGeneration = focusGeneration
+        request.phase = .restoring(acknowledgedGeneration: focusGeneration)
+        expectedOwnActivation = false
+        self.request = request
         return true
     }
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compile only storage/model/thumbnail code; never start the application or touch its history.
+# Compile only storage/model/thumbnail code and pure policies; never start the application or touch its history.
 # author: helele
 # since: 2026-10-20
 set -euo pipefail
@@ -43,6 +43,7 @@ xcrun swiftc -O -swift-version 6 -target "$ARCH-apple-macosx26.5" -sdk "$SDK" \
   "$ROOT/CVMaster/ThumbnailPipeline.swift" \
   "$ROOT/CVMaster/ClipboardCapturePolicy.swift" \
   "$ROOT/CVMaster/PasteHandoffPolicy.swift" \
+  "$ROOT/CVMaster/PasteFocusRestoration.swift" \
   "$ROOT/Validation/RegressionChecks.swift" \
   -lsqlite3 -o "$WORK/regression-checks"
 "$WORK/regression-checks" --workspace "$WORK/data" "$@"

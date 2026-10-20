@@ -206,12 +206,12 @@ enum StorageLimits {
 /// 面向用户的可控失败提示；日志不输出正文、路径或原始 SQL 参数。
 enum LibraryError: LocalizedError {
     case storage, capacity, unsupported, missingContent, unavailableFile, nameConflict, plainTextUnavailable, richTextTooLarge
-    /// 自动粘贴授权缺失，或原输入位置不可用；与内容 / 存储错误分别提示。
+    /// 自动粘贴授权缺失，或当前激活的 APP 不可用；与内容 / 存储错误分别提示。
     case pastePermissionRequired, pasteTargetUnavailable
     var errorDescription: String? {
         switch self {
         case .pastePermissionRequired: "尚未获得辅助功能权限。请在“系统设置 → 隐私与安全性 → 辅助功能”中开启 cvMaster；若已开启仍无效，请移除旧条目后重新添加 ~/Applications/cvMaster.app。剪贴板未改变。"
-        case .pasteTargetUnavailable: "未能向原输入位置发送粘贴，请聚焦可编辑输入框后重新打开列表；若剪贴板已更新，可手动按 ⌘V。"
+        case .pasteTargetUnavailable: "未能向当前激活的 APP 发送粘贴，请聚焦可编辑输入框后重新打开列表；若剪贴板已更新，可手动按 ⌘V。"
         case .storage: "本地存储不可用，请检查磁盘空间或重新打开应用。"
         case .capacity: "存储已达上限，请清理记录；置顶和已分组内容不会被自动删除。"
         case .unsupported: "内容格式暂不支持，或超过单条保存限额。"
