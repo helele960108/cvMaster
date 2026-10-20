@@ -46,7 +46,13 @@ struct PreferencesView: View {
                 Form {
                     Section {
                         LabeledContent("已用条数", value: "\(library.storedEntries.formatted()) 条 / \(StorageLimits.maximumEntries.formatted()) 条")
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("已用条数")
+                            .accessibilityValue("\(library.storedEntries.formatted()) 条，上限 \(StorageLimits.maximumEntries.formatted()) 条")
                         LabeledContent("已用内容量", value: "\(byteText(library.storedBytes)) / \(byteText(StorageLimits.maximumBytes))")
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("已用内容量")
+                            .accessibilityValue("\(byteText(library.storedBytes))，上限 \(byteText(StorageLimits.maximumBytes))")
                         Text("内容量仅统计内容表示，不含数据库、WAL 和原始文件。")
                             .font(.caption).foregroundStyle(.secondary)
                         Picker("历史保留", selection: $library.retention) {
@@ -98,9 +104,11 @@ struct PreferencesView: View {
             }
         } message: { request in
             if let cutoff = request.cutoff {
-                Text("将永久删除早于 \(cutoff.formatted(date: .abbreviated, time: .shortened)) 的记录，包含其中的置顶与分组内容；保留分组结构，不删除引用的原文件。")
+                let message = "将永久删除早于 \(cutoff.formatted(date: .abbreviated, time: .shortened)) 的记录，包含其中的置顶与分组内容；保留分组结构，不删除引用的原文件。"
+                Text(message).accessibilityLabel(message)
             } else {
-                Text("将永久删除全部历史记录，包含置顶与分组内容；保留分组结构，不删除引用的原文件。")
+                let message = "将永久删除全部历史记录，包含置顶与分组内容；保留分组结构，不删除引用的原文件。"
+                Text(message).accessibilityLabel(message)
             }
         }
     }

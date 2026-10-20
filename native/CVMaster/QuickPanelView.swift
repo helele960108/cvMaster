@@ -160,14 +160,20 @@ struct QuickPanelView: View {
     }
 
     /// 原生菜单覆盖展示，不改变列表高度；固定命中区域与清除搜索按钮互不重叠。
+    /// 直接使用按钮而非内嵌 Picker，避免 Picker 标签在菜单中额外占一行。
     private var timeFilter: some View {
         Menu {
-            Picker("复制时间", selection: $library.timeRange) {
-                ForEach(ClipTimeRange.allCases) { range in
-                    Text(range.rawValue).tag(range)
+            ForEach(ClipTimeRange.allCases) { range in
+                Button {
+                    library.timeRange = range
+                } label: {
+                    if library.timeRange == range {
+                        Label(range.rawValue, systemImage: "checkmark")
+                    } else {
+                        Text(range.rawValue)
+                    }
                 }
             }
-            .pickerStyle(.inline)
         } label: {
             Image(systemName: "clock")
                 .foregroundStyle(library.timeRange == .all ? Color.secondary : ClipboardLibrary.accent)
@@ -225,9 +231,17 @@ struct QuickPanelView: View {
             if library.loading && library.clips.isEmpty {
                 ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if library.visibleClips.isEmpty {
-                ContentUnavailableView {
-                    Label(library.query.isEmpty ? "还没有内容" : "没有找到内容", systemImage: "tray")
-                } description: { Text("换个分组、时间范围或关键词试试。") }
+                // 轻量空状态避免 ContentUnavailableView 在浮层缩容时产生递归布局。
+                VStack(spacing: 6) {
+                    Image(systemName: "tray").font(.title2).foregroundStyle(.secondary)
+                    Text(library.query.isEmpty ? "还没有内容" : "没有找到内容")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("换个分组、时间范围或关键词试试。")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(16)
+                .accessibilityElement(children: .combine)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -267,7 +281,10 @@ struct QuickPanelView: View {
         )
         .disabled(library.copying || library.loading)
         .help("单击选中，双击粘贴到原输入位置；悬停查看预览")
-        .accessibilityHint("双击粘贴")
+        // 每行只暴露一条合并后的语义，避免图片、来源和类型子元素重复朗读。
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel(for: clip))
+        .accessibilityHint("双击粘贴；悬停查看预览")
         .accessibilityAction(named: Text("粘贴")) {
             library.selection = clip.id
             library.paste(clip)
@@ -328,6 +345,24 @@ struct QuickPanelView: View {
         guard previewID != id else { return }
         previewID = id
         library.loadPreview(id)
+    }
+
+    /// 单行语义合并为一条：置顶状态、类型与正文（或文件名）、来源应用。
+    private func accessibilityLabel(for clip: Clip) -> String {
+        var parts: [String] = []
+        if clip.pinned { parts.append("已置顶") }
+        switch clip.kind {
+        case .image:
+            parts.append("图片")
+        case .file:
+            parts.append("文件：\(clip.title)")
+        case .text, .link:
+            let text = (clip.excerpt.isEmpty ? clip.title : clip.excerpt)
+                .replacingOccurrences(of: "\n", with: " ")
+            parts.append("\(clip.kind.rawValue)：\(String(text.prefix(120)))")
+        }
+        parts.append("来自\(clip.source)")
+        return parts.joined(separator: "，")
     }
 
     /// 悬停 280 ms 才加载，离开延迟 200 ms，允许鼠标进入侧边预览操作。

@@ -300,7 +300,8 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         pasteLogger.notice("Paste activation requested: accepted=\(activated)")
         // 仅保留最后一个阻塞条件，不记录窗口标题、聊天对象或输入内容。
         var blockedStage = "activation"
-        for _ in 0..<40 {
+        // 最长等待 2.5 秒；少数应用切换前台或释放修饰键会跨越多帧。
+        for _ in 0..<100 {
             try await Task.sleep(for: .milliseconds(25))
             let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
             let modifiers = CGEventSource.flagsState(.combinedSessionState)

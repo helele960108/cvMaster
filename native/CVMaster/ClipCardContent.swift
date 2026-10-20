@@ -53,7 +53,8 @@ struct ClipCardContent: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-            .accessibilityLabel("图片，来自\(clip.source)，悬停查看详情")
+            // 卡片作为列表行的装饰内容，语义由外层行统一提供，避免重复朗读。
+            .accessibilityHidden(true)
     }
 
     /// 非图片记录维持正文优先、来源沉底的紧凑布局。
