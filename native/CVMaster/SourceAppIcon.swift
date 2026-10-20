@@ -27,7 +27,7 @@ struct SourceAppIcon: View {
         .accessibilityHidden(true)
         .task(id: bundleID) {
             image = nil
-            // 等待首帧提交；滚动途中被回收的行不执行应用图标查询。
+            // 先让出执行机会；任务已取消的行不再查询图标，但不保证首帧已经提交。
             await Task.yield()
             guard !Task.isCancelled, !bundleID.isEmpty else { return }
             image = ApplicationDirectory.shared.icon(for: bundleID)

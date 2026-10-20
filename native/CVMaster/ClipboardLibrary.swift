@@ -4,6 +4,8 @@
  * @since 2026-10-19
  */
 import AppKit
+@preconcurrency import ApplicationServices
+import ServiceManagement
 import SwiftUI
 import OSLog
 
@@ -57,6 +59,20 @@ final class ClipboardLibrary: ObservableObject {
 
     @Published var selection: UUID?
     @Published var shortcutAvailable = true
+    /// 当前全局快捷键；注册由应用代理执行，成功后才持久化。
+    @Published private(set) var globalShortcut = GlobalShortcut.load()
+    /// 最近一次录制失败或启动注册失败的原因。
+    @Published private(set) var shortcutConflict: String?
+    /// 应用代理注入：尝试注册新组合，返回冲突说明或 nil。
+    var applyGlobalShortcut: ((GlobalShortcut) -> String?)?
+    /// 辅助功能权限状态；浮层引导与设置页共用，每次从系统实时读取。
+    @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
+    /// 系统授权提示每次应用运行最多触发一次，避免反复弹窗。
+    private var accessibilityPromptShown = false
+    /// 登录项状态直接读取系统，不使用独立偏好副本。
+    @Published private(set) var launchAtLogin = false
+    /// 已注册但等待用户在系统设置中批准。
+    @Published private(set) var launchAtLoginRequiresApproval = false
     /// 外观偏好只存储枚举字符串；应用代理订阅变化并同步原生容器，不重建浮层或轮询服务。
     @Published var appearance = AppAppearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system {
         didSet {
@@ -67,7 +83,12 @@ final class ClipboardLibrary: ObservableObject {
     @Published var recordingEnabled = UserDefaults.standard.bool(forKey: "recordingEnabled") {
         didSet { UserDefaults.standard.set(recordingEnabled, forKey: "recordingEnabled"); monitor?.resetBaseline() }
     }
-    @Published var paused = false { didSet { monitor?.resetBaseline() } }
+    @Published var paused = UserDefaults.standard.bool(forKey: "recordingPaused") {
+        didSet {
+            UserDefaults.standard.set(paused, forKey: "recordingPaused")
+            monitor?.resetBaseline()
+        }
+    }
     /// 0 表示不按时间清理；缺省仍为 30 天，容量上限始终生效。
     @Published var retention = (UserDefaults.standard.object(forKey: "retentionDays") == nil
         ? 30
@@ -94,15 +115,19 @@ final class ClipboardLibrary: ObservableObject {
     @Published private(set) var copying = false
     @Published private(set) var preview: ClipPreview?
     @Published private(set) var previewLoading = false
-    /// 写入剪贴板前校验原输入位置与辅助功能权限，失败时保留原剪贴板。
+    /// 写入剪贴板前校验当前激活的 APP 与辅助功能权限，失败时保留原剪贴板。
     var validatePasteTarget: (() throws -> Void)?
-    /// 写入完成后由原生容器收起浮层、恢复焦点并发送粘贴；等待期间阻止重复操作。
+    /// 关闭列表并确认目标 APP 稳定激活；成功后才允许改写剪贴板。
+    var preparePasteTarget: (() async throws -> Void)?
+    /// 写入完成后重新核验目标并发送粘贴；等待期间阻止重复操作。
     var performPaste: (() async throws -> Void)?
     /// 生命周期由应用代理持有；监测器反向弱引用本对象。
     var monitor: ClipboardMonitor?
     private let store = HistoryStore()
     private let logger = Logger(subsystem: "local.helele.cvmaster", category: "library")
     private var searchTask: Task<Void, Never>?
+    /// 清空等待已接收的写入结束，避免尚未进入存储 actor 的旧快照在清空后落盘。
+    private var captureTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     /// 分组目录单独刷新，不被搜索防抖任务取消，也不接收历史页的旧目录。
     private var groupsTask: Task<Void, Never>?
@@ -123,7 +148,116 @@ final class ClipboardLibrary: ObservableObject {
     var selectedClip: Clip? { clips.first { $0.id == selection } }
     var hasMore: Bool { clips.count < total && clips.count < StorageLimits.maximumLoaded }
 
-    func start() { refreshGroups(); scheduleSearch() }
+    func start() { refreshGroups(); scheduleSearch(); refreshAccessibilityStatus(); refreshLaunchAtLoginStatus() }
+
+    /// 重新读取系统授权状态；打开浮层、应用激活和进入设置时调用，不做定时轮询。
+    func refreshAccessibilityStatus() {
+        let granted = AXIsProcessTrusted()
+        if granted != accessibilityGranted {
+            accessibilityGranted = granted
+            // 重新授权后复位，未来若再次撤销权限仍可触发一次系统提示。
+            if granted { accessibilityPromptShown = false }
+        }
+    }
+
+    /// 首次缺少权限时触发系统授权提示，确保应用出现在辅助功能列表中。
+    func promptForAccessibilityIfNeeded() {
+        guard !AXIsProcessTrusted(), !accessibilityPromptShown else { return }
+        accessibilityPromptShown = true
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    /// 首次点击先走系统授权提示，之后直接打开辅助功能设置页。
+    func openAccessibilitySettings() {
+        guard !AXIsProcessTrusted() else { refreshAccessibilityStatus(); return }
+        if !accessibilityPromptShown {
+            promptForAccessibilityIfNeeded()
+            return
+        }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+        refreshAccessibilityStatus()
+    }
+
+    /// 读取系统登录项状态；应用激活或进入设置时调用，不维护独立偏好副本。
+    func refreshLaunchAtLoginStatus() {
+        let status = SMAppService.mainApp.status
+        launchAtLogin = status == .enabled || status == .requiresApproval
+        launchAtLoginRequiresApproval = status == .requiresApproval
+    }
+
+    /// 注册或移除登录项；需要用户批准时保持开启状态，并在设置页给出入口。
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else if launchAtLogin {
+                // 系统设置中可能已关闭该项；状态未标记为开启时不重复调用 unregister。
+                try SMAppService.mainApp.unregister()
+            }
+            refreshLaunchAtLoginStatus()
+            if launchAtLoginRequiresApproval {
+                notify("登录项已注册，请在系统设置 → 通用 → 登录项中允许 cvMaster")
+            } else if launchAtLogin == enabled {
+                notify(enabled ? "已开启登录时启动" : "已关闭登录时启动")
+            } else {
+                notify("登录项状态未改变，请在系统设置中检查")
+            }
+        } catch {
+            refreshLaunchAtLoginStatus()
+            notify("无法更新登录时启动：\(error.localizedDescription)")
+        }
+    }
+
+    /// 打开系统设置 → 通用 → 登录项，供待批准状态使用。
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    /// 应用代理回写真实注册状态；启动注册失败或恢复失败时由代理调用。
+    func setShortcutRegistration(available: Bool, conflict: String?) {
+        shortcutAvailable = available
+        shortcutConflict = conflict
+    }
+
+    /// 先校验组合，再交由应用代理注册；失败保留原快捷键并显示原因。
+    @discardableResult
+    func updateGlobalShortcut(_ shortcut: GlobalShortcut) -> Bool {
+        if shortcut == globalShortcut, shortcutAvailable {
+            shortcutConflict = nil
+            return true
+        }
+        if let message = shortcut.validationMessage {
+            shortcutConflict = message
+            return false
+        }
+        guard let applyGlobalShortcut else {
+            shortcutConflict = "快捷键服务尚未就绪"
+            return false
+        }
+        if let error = applyGlobalShortcut(shortcut) {
+            shortcutConflict = error
+            return false
+        }
+        shortcutConflict = nil
+        shortcutAvailable = true
+        globalShortcut = shortcut
+        shortcut.save()
+        return true
+    }
+
+    /// 开始录制新组合时清除上一次的校验失败提示；注册服务本身不可用时保留原因。
+    func clearShortcutConflict() {
+        guard shortcutAvailable else { return }
+        shortcutConflict = nil
+    }
+
+    /// 恢复默认 ⌥Space；同样经过冲突检查。
+    func resetGlobalShortcut() {
+        updateGlobalShortcut(.defaultShortcut)
+    }
 
     /// 设置页打开时刷新全库容量统计，不受当前搜索、分组或时间筛选影响。
     func refreshStorageStats() {
@@ -139,6 +273,7 @@ final class ClipboardLibrary: ObservableObject {
 
     func panelOpened() {
         panelVisible = true
+        refreshAccessibilityStatus()
         refreshGroups()
         preview = nil
         scheduleSearch()
@@ -158,7 +293,7 @@ final class ClipboardLibrary: ObservableObject {
         limit = StorageLimits.pageSize
     }
 
-    /// 保留至多一个待执行查询；中文子串用 SQLite LIKE，避免主线程扫描全库。
+    /// 防抖并拒绝旧结果；子串匹配与可用索引由存储层统一选择。
     func scheduleSearch(debounce: Bool = false, resetLimit: Bool = true) {
         searchVersion += 1
         let version = searchVersion
@@ -227,17 +362,19 @@ final class ClipboardLibrary: ObservableObject {
 
     /// 主线程只移交有界快照；哈希、去重、写文件和关系操作都在 actor 上执行。
     func accept(_ capture: ClipCapture) {
-        guard !captureBusy, !clearing else { skippedChange(); return }
+        guard recordingEnabled, !paused, !captureBusy, !clearing else { skippedChange(); return }
         captureBusy = true
         let days = retention
-        Task { [weak self, store] in
+        captureTask = Task { [weak self, store] in
             do {
                 try await store.save(capture, retention: days)
                 guard let self else { return }
                 self.captureBusy = false
+                self.captureTask = nil
                 if self.panelVisible { self.scheduleSearch() }
             } catch {
                 self?.captureBusy = false
+                self?.captureTask = nil
                 self?.report(error)
             }
         }
@@ -254,7 +391,7 @@ final class ClipboardLibrary: ObservableObject {
         guard !copying, !loading else { return }
         guard !plainText || clip.kind == .text || clip.kind == .link else { return }
         do {
-            guard let validatePasteTarget, performPaste != nil else { throw LibraryError.pasteTargetUnavailable }
+            guard let validatePasteTarget, preparePasteTarget != nil, performPaste != nil else { throw LibraryError.pasteTargetUnavailable }
             try validatePasteTarget()
         } catch { report(error); return }
         copying = true
@@ -273,6 +410,11 @@ final class ClipboardLibrary: ObservableObject {
                     }
                     items[representation.item] = item
                 }
+                guard let preparePasteTarget = self.preparePasteTarget else { throw LibraryError.pasteTargetUnavailable }
+                try await preparePasteTarget()
+                // 深度检查包含挂起点，写入前再次检查权限与交接状态，中间不再 await。
+                guard let validatePasteTarget = self.validatePasteTarget else { throw LibraryError.pasteTargetUnavailable }
+                try validatePasteTarget()
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()
                 guard pasteboard.writeObjects(items.keys.sorted().compactMap { items[$0] }) else {
@@ -366,7 +508,9 @@ final class ClipboardLibrary: ObservableObject {
     private func performClear(before cutoff: Date?) {
         guard !clearing else { return }
         clearing = true
+        let pendingCapture = captureTask
         Task { [weak self, store] in
+            await pendingCapture?.value
             do {
                 let removed: Int
                 if let cutoff {

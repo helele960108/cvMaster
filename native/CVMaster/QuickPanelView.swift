@@ -27,6 +27,8 @@ struct QuickPanelView: View {
     @ViewState<Bool> private var deleting = false
     /// 拖动期间暂停侧边预览，避免浮层重新锚定干扰连续调整。
     @ViewState<Bool> private var resizing = false
+    /// 权限横幅仅在本次应用运行内可稍后关闭，下次启动仍会提示。
+    @ViewState<Bool> private var permissionBannerDismissed = false
     /// 搜索焦点，在每次浮层显示时恢复。
     @FocusState private var focused: Bool
     /// 系统设置入口只从次级菜单触发。
@@ -38,6 +40,7 @@ struct QuickPanelView: View {
             header
             search
             filters
+            if showsPermissionBanner { permissionBanner }
             Divider().padding(.horizontal, 14)
             if !library.recordingEnabled {
                 VStack(alignment: .leading, spacing: 9) {
@@ -61,6 +64,10 @@ struct QuickPanelView: View {
         .onChange(of: library.scope) { dismissPreview() }
         .onChange(of: library.kind) { dismissPreview() }
         .onChange(of: library.timeRange) { dismissPreview() }
+        .onChange(of: library.accessibilityGranted) {
+            // 重新授权后复位，未来若再次撤销权限仍会显示引导。
+            if library.accessibilityGranted { permissionBannerDismissed = false }
+        }
         .onChange(of: library.clips.map(\.id)) { dismissPreview() }
         .onChange(of: editingGroup) { if editingGroup { dismissPreview() } }
         .onChange(of: deleting) { if deleting { dismissPreview() } }
@@ -170,15 +177,69 @@ struct QuickPanelView: View {
         }.padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 6)
     }
 
+    /// 仅在已开启记录且缺少辅助功能权限时提示；关闭记录时由记录引导优先。
+    private var showsPermissionBanner: Bool {
+        library.recordingEnabled && !library.accessibilityGranted && !permissionBannerDismissed
+    }
+
+    /// 情境式权限引导：说明用途、直达系统设置，并允许本次运行内稍后处理。
+    private var permissionBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "hand.raised.fill")
+                .font(.caption)
+                .foregroundStyle(ClipboardLibrary.accent)
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("自动粘贴需要辅助功能权限")
+                    .font(.caption.weight(.semibold))
+                Text("授权后，回车或双击可直接粘贴到当前激活的 APP。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+            Spacer(minLength: 4)
+            Button("去开启") { library.openAccessibilitySettings() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .help("打开系统设置 → 隐私与安全性 → 辅助功能")
+            Button { permissionBannerDismissed = true } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("稍后")
+            .help("本次使用期间不再提示")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(ClipboardLibrary.accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(ClipboardLibrary.accent.opacity(0.25), lineWidth: 1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
+    }
+
     /// 原生菜单覆盖展示，不改变列表高度；固定命中区域与清除搜索按钮互不重叠。
+    /// 直接使用按钮而非内嵌 Picker，避免 Picker 标签在菜单中额外占一行。
     private var timeFilter: some View {
         Menu {
-            Picker("复制时间", selection: $library.timeRange) {
-                ForEach(ClipTimeRange.allCases) { range in
-                    Text(range.rawValue).tag(range)
+            ForEach(ClipTimeRange.allCases) { range in
+                Button {
+                    library.timeRange = range
+                } label: {
+                    if library.timeRange == range {
+                        Label(range.rawValue, systemImage: "checkmark")
+                    } else {
+                        Text(range.rawValue)
+                    }
                 }
             }
-            .pickerStyle(.inline)
         } label: {
             Image(systemName: "clock")
                 .foregroundStyle(library.timeRange == .all ? Color.secondary : ClipboardLibrary.accent)
@@ -236,9 +297,17 @@ struct QuickPanelView: View {
             if library.loading && library.clips.isEmpty {
                 ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if library.visibleClips.isEmpty {
-                ContentUnavailableView {
-                    Label(library.query.isEmpty ? "还没有内容" : "没有找到内容", systemImage: "tray")
-                } description: { Text("换个分组、时间范围或关键词试试。") }
+                // 轻量空状态避免 ContentUnavailableView 在浮层缩容时产生递归布局。
+                VStack(spacing: 6) {
+                    Image(systemName: "tray").font(.title2).foregroundStyle(.secondary)
+                    Text(library.query.isEmpty ? "还没有内容" : "没有找到内容")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("换个分组、时间范围或关键词试试。")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(16)
+                .accessibilityElement(children: .combine)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -248,7 +317,7 @@ struct QuickPanelView: View {
                                 Button("加载更多") { library.loadMore() }
                                     .buttonStyle(PanelButtonStyle()).font(.caption).padding(8).disabled(library.loading)
                             } else if library.clips.count == StorageLimits.maximumLoaded {
-                                Text("已加载 300 条，请搜索缩小范围").font(.caption).foregroundStyle(.secondary)
+                                Text("已加载 \(StorageLimits.maximumLoaded) 条，请搜索缩小范围").font(.caption).foregroundStyle(.secondary)
                             }
                         }.padding(12)
                     }
@@ -277,8 +346,11 @@ struct QuickPanelView: View {
             }
         )
         .disabled(library.copying || library.loading)
-        .help("单击选中，双击粘贴到原输入位置；悬停查看预览")
-        .accessibilityHint("双击粘贴")
+        .help("单击选中，双击粘贴到当前激活的 APP；悬停查看预览")
+        // 每行只暴露一条合并后的语义，避免图片、来源和类型子元素重复朗读。
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel(for: clip))
+        .accessibilityHint("双击粘贴；悬停查看预览")
         .accessibilityAction(named: Text("粘贴")) {
             library.selection = clip.id
             library.paste(clip)
@@ -306,7 +378,7 @@ struct QuickPanelView: View {
             if clip.kind == .text || clip.kind == .link {
                 Button("粘贴为纯文本", systemImage: "textformat") { library.paste(clip, plainText: true) }
                     .disabled(library.copying || library.loading)
-                    .help("移除格式后粘贴到原输入位置")
+                    .help("移除格式后粘贴到当前激活的 APP")
             }
             Button(clip.pinned ? "取消置顶" : "置顶", systemImage: "pin") { library.setPinned(clip) }
             Menu("加入分组") {
@@ -341,6 +413,24 @@ struct QuickPanelView: View {
         library.loadPreview(id)
     }
 
+    /// 单行语义合并为一条：置顶状态、类型与正文（或文件名）、来源应用。
+    private func accessibilityLabel(for clip: Clip) -> String {
+        var parts: [String] = []
+        if clip.pinned { parts.append("已置顶") }
+        switch clip.kind {
+        case .image:
+            parts.append("图片")
+        case .file:
+            parts.append("文件：\(clip.title)")
+        case .text, .link:
+            let text = (clip.excerpt.isEmpty ? clip.title : clip.excerpt)
+                .replacingOccurrences(of: "\n", with: " ")
+            parts.append("\(clip.kind.rawValue)：\(String(text.prefix(120)))")
+        }
+        parts.append("来自\(clip.source)")
+        return parts.joined(separator: "，")
+    }
+
     /// 悬停 280 ms 才加载，离开延迟 200 ms，允许鼠标进入侧边预览操作。
     private func schedulePreview(_ id: UUID, inside: Bool) {
         guard !resizing else { return }
@@ -372,8 +462,11 @@ struct QuickPanelView: View {
                 } else {
                     Text("\(library.total) 条 · 本地保存").foregroundStyle(.secondary)
                     Spacer()
-                    Text(library.shortcutAvailable ? "⌥Space" : "热键不可用")
+                    Text(library.shortcutAvailable ? library.globalShortcut.display : "热键不可用")
                         .foregroundStyle(library.shortcutAvailable ? Color.secondary : .orange)
+                        .lineLimit(1)
+                        .help(library.shortcutAvailable ? "全局快捷键：\(library.globalShortcut.display)"
+                                                        : "全局快捷键不可用，请在设置中重新录制")
                         .help("↑↓ 选择，回车或双击粘贴；Esc 收起")
                 }
             }.font(.caption2).padding(.horizontal, 18).padding(.vertical, 11)
