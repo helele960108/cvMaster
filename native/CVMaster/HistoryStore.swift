@@ -17,6 +17,50 @@ private enum SQLValue {
     case text(String), integer(Int), real(Double)
 }
 
+/// 缩略图来源：内置资产可直接解码，外部引用必须离开串行存储 actor 再读取。
+private enum ThumbnailSource: Sendable {
+    case stored(URL), referenced(URL)
+}
+
+/// 超时与正常失败分开，只有超时文件才在同一进程内跳过，避免反复创建阻塞读取。
+private enum ThumbnailOutcome: Sendable {
+    case finished(Data?), timedOut
+}
+
+/// 异常挂载点上的文件可能让系统调用永久阻塞；记录后本次运行不再重试同一资产。
+private final class TimedOutThumbnailCache: @unchecked Sendable {
+    static let shared = TimedOutThumbnailCache()
+    private let lock = NSLock()
+    private var paths: Set<String> = []
+
+    func contains(_ path: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return paths.contains(path)
+    }
+
+    func insert(_ path: String) {
+        lock.lock(); paths.insert(path); lock.unlock()
+    }
+}
+
+/// 只允许第一个结果恢复等待者；卡死任务稍后完成时不会再次恢复。
+private final class ThumbnailRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<ThumbnailOutcome, Never>?
+
+    init(_ continuation: CheckedContinuation<ThumbnailOutcome, Never>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ outcome: ThumbnailOutcome) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: outcome)
+    }
+}
+
 actor HistoryStore {
     /// 数据库连接仅由本 actor 访问，避免并发共享 SQLite 指针。
     private var database: OpaquePointer?
@@ -484,73 +528,81 @@ actor HistoryStore {
 
     /// 按 item 原顺序聚合文本，文件引用仅展示文件名，不将本地路径交付预览。
     /// 整条详情共享 16 KB 文本及 256 KB RTF 解析预算，只生成一张缩略图。
-    func preview(_ id: UUID, thumbnailOnly: Bool = false) throws -> ClipPreview {
+    func preview(_ id: UUID) async throws -> ClipPreview {
         try prepare()
         // 显式排序表示优先级，避免随机资产 UUID 决定同一 item 展示哪种文本。
-        let query = try statement("""
-            SELECT uti,filename,item_order FROM representation WHERE entry_id=?
-            ORDER BY item_order,CASE uti WHEN 'public.file-url' THEN 0
-                WHEN 'public.utf8-plain-text' THEN 1 WHEN 'public.url' THEN 2
-                WHEN 'public.rtf' THEN 3 ELSE 4 END,id
-            """, [.text(id.uuidString)])
-        defer { sqlite3_finalize(query) }
         var preview = ""
         var textItems: Set<Int> = []
         var richTextBudget = ClipboardFormats.maximumRichTextPreviewBytes
         var truncated = false
-        var thumbnail: Data?
+        var storedThumbnail: URL?
+        var referencedThumbnail: URL?
         // 预留截断提示空间，正文与提示合计不超过 16 KB。
         let textBudget = 16_000
-        while true {
-            let status = sqlite3_step(query)
-            if status == SQLITE_DONE { break }
-            guard status == SQLITE_ROW else { throw LibraryError.storage }
-            let type = text(query, 0)
-            let item = Int(sqlite3_column_int(query, 2))
-            guard let url = assetURL(text(query, 1)) else { continue }
-            // 缺失或无法解析的表示不占用 item，允许其他格式继续回退。
-            if !thumbnailOnly, !textItems.contains(item) {
-                let separator = preview.isEmpty ? "" : "\n"
-                let remaining = textBudget - preview.utf8.count - separator.utf8.count
-                var value: String?
-                if type == "public.file-url" {
-                    // 路径只用于内部读取与再次复制，预览仅交付解码后的末级文件名。
-                    if let data = previewData(url, maximum: 16_385), data.count <= 16_384,
-                       let raw = String(data: data, encoding: .utf8),
-                       let reference = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-                       reference.isFileURL {
-                        value = reference.lastPathComponent
-                    }
-                } else if ["public.utf8-plain-text", "public.url"].contains(type) {
-                    if let data = previewData(url, maximum: max(1, remaining + 1)), !data.isEmpty {
-                        value = String(decoding: data, as: UTF8.self)
-                    }
-                } else if type == "public.rtf",
-                          let data = previewData(url, maximum: richTextBudget + 1), data.count <= richTextBudget {
-                    richTextBudget -= data.count
-                    value = ClipboardFormats.richText(data)
-                }
-                if let value, !value.isEmpty {
-                    textItems.insert(item)
-                    if remaining > 0 {
-                        var bounded = String(decoding: value.utf8.prefix(remaining), as: UTF8.self)
-                        // 截在多字节字符中间时替换字符可能多占字节，收紧到总预算内。
-                        while bounded.utf8.count > remaining { bounded.removeLast() }
-                        preview += separator + bounded
-                        if bounded != value { truncated = true }
-                    } else {
-                        truncated = true
-                    }
-                }
-            }
-            if thumbnail == nil {
+        do {
+            let query = try statement("""
+                SELECT uti,filename,item_order FROM representation WHERE entry_id=?
+                ORDER BY item_order,CASE uti WHEN 'public.file-url' THEN 0
+                    WHEN 'public.utf8-plain-text' THEN 1 WHEN 'public.url' THEN 2
+                    WHEN 'public.rtf' THEN 3 ELSE 4 END,id
+                """, [.text(id.uuidString)])
+            defer { sqlite3_finalize(query) }
+            while true {
+                let status = sqlite3_step(query)
+                if status == SQLITE_DONE { break }
+                guard status == SQLITE_ROW else { throw LibraryError.storage }
+                let type = text(query, 0)
+                let item = Int(sqlite3_column_int(query, 2))
+                guard let url = assetURL(text(query, 1)) else { continue }
+                // 缩略图只记录候选；查询结束后再在 actor 外生成，引用文件阻塞时不影响其他存储操作。
                 if ClipboardFormats.rasterImages.contains(type) {
-                    thumbnail = makeThumbnail(url, maximum: thumbnailOnly ? 640 : 420)
-                } else if type == "public.file-url" {
-                    // 旧记录也可按需解析引用；不修改剪贴板表示，不将原文件读入 Data。
-                    thumbnail = referencedImageThumbnail(url, maximum: thumbnailOnly ? 640 : 420)
+                    if storedThumbnail == nil { storedThumbnail = url }
+                } else if type == "public.file-url", referencedThumbnail == nil {
+                    referencedThumbnail = url
+                }
+                // 缺失或无法解析的表示不占用 item，允许其他格式继续回退。
+                if !textItems.contains(item) {
+                    let separator = preview.isEmpty ? "" : "\n"
+                    let remaining = textBudget - preview.utf8.count - separator.utf8.count
+                    var value: String?
+                    if type == "public.file-url" {
+                        // 路径只用于内部读取与再次复制，预览仅交付解码后的末级文件名。
+                        if let data = previewData(url, maximum: 16_385), data.count <= 16_384,
+                           let raw = String(data: data, encoding: .utf8),
+                           let reference = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+                           reference.isFileURL {
+                            value = reference.lastPathComponent
+                        }
+                    } else if ["public.utf8-plain-text", "public.url"].contains(type) {
+                        if let data = previewData(url, maximum: max(1, remaining + 1)), !data.isEmpty {
+                            value = String(decoding: data, as: UTF8.self)
+                        }
+                    } else if type == "public.rtf",
+                              let data = previewData(url, maximum: richTextBudget + 1), data.count <= richTextBudget {
+                        richTextBudget -= data.count
+                        value = ClipboardFormats.richText(data)
+                    }
+                    if let value, !value.isEmpty {
+                        textItems.insert(item)
+                        if remaining > 0 {
+                            var bounded = String(decoding: value.utf8.prefix(remaining), as: UTF8.self)
+                            // 截在多字节字符中间时替换字符可能多占字节，收紧到总预算内。
+                            while bounded.utf8.count > remaining { bounded.removeLast() }
+                            preview += separator + bounded
+                            if bounded != value { truncated = true }
+                        } else {
+                            truncated = true
+                        }
+                    }
                 }
             }
+        }
+        var thumbnail: Data?
+        if let storedThumbnail {
+            // 已保存的像素表示优先；即使同时存在文件引用，也不读取原文件。
+            thumbnail = await Self.boundedThumbnail(.stored(storedThumbnail), maximum: 420)
+        } else if let referencedThumbnail {
+            thumbnail = await Self.boundedThumbnail(.referenced(referencedThumbnail), maximum: 420)
         }
         if truncated { preview += "\n…预览已截断，复制保留原始内容" }
         return ClipPreview(text: preview, thumbnail: thumbnail)
@@ -565,7 +617,7 @@ actor HistoryStore {
 
     /// 仅接受本地、非符号链接的普通图片文件，拒绝网络卷和未下载云文件。
     /// 引用只保存路径，源文件删除、移动或无权限时返回空，不中断其他内容预览。
-    private func referencedImageThumbnail(_ asset: URL, maximum: Int) -> Data? {
+    nonisolated private static func referencedImageThumbnail(_ asset: URL, maximum: Int) -> Data? {
         guard let handle = try? FileHandle(forReadingFrom: asset) else { return nil }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: 16_385), data.count <= 16_384,
@@ -583,7 +635,7 @@ actor HistoryStore {
     }
 
     /// ImageIO 直接从文件降采样，关闭原图解码缓存；输出始终受目标像素上限约束。
-    private func makeThumbnail(_ url: URL, maximum: Int) -> Data? {
+    nonisolated private static func makeThumbnail(_ url: URL, maximum: Int) -> Data? {
         let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let source = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0,
@@ -596,25 +648,89 @@ actor HistoryStore {
         return CGImageDestinationFinalize(destination) ? output as Data : nil
     }
 
+    /// 文件读取与解码可能因异常挂载点永久阻塞；放到 actor 外执行并限制等待时间。
+    /// 使用非结构化任务竞速，避免结构化任务组在退出时继续等待卡死的子任务。
+    /// 超时后记录该资产，本次运行不再重试，串行 SQLite 与列表查询继续工作。
+    nonisolated private static func boundedThumbnail(_ source: ThumbnailSource, maximum: Int) async -> Data? {
+        let key: String?
+        if case .referenced(let asset) = source {
+            key = asset.path
+            if TimedOutThumbnailCache.shared.contains(asset.path) { return nil }
+        } else {
+            key = nil
+        }
+        let generation = Task.detached(priority: .utility) {
+            generateThumbnail(source, maximum: maximum)
+        }
+        let timeout = Task.detached {
+            try? await Task.sleep(for: .seconds(3))
+            return !Task.isCancelled
+        }
+        let outcome: ThumbnailOutcome = await withCheckedContinuation { continuation in
+            let race = ThumbnailRace(continuation)
+            Task.detached {
+                let data = await generation.value
+                race.finish(.finished(data))
+            }
+            Task.detached {
+                if await timeout.value { race.finish(.timedOut) }
+            }
+        }
+        if case .timedOut = outcome {
+            if let key { TimedOutThumbnailCache.shared.insert(key) }
+            return nil
+        }
+        guard case .finished(let data) = outcome else { return nil }
+        return data
+    }
+
+    nonisolated private static func generateThumbnail(_ source: ThumbnailSource, maximum: Int) -> Data? {
+        switch source {
+        case .stored(let url): return makeThumbnail(url, maximum: maximum)
+        case .referenced(let asset): return referencedImageThumbnail(asset, maximum: maximum)
+        }
+    }
+
     /// 列表缩略图缓存最多 24 张，总量最多 2 MB；只缓存降采样 PNG，不读取完整图片到 UI。
     private var thumbnails: [UUID: Data] = [:]
     private var thumbnailOrder: [UUID] = []
 
-    func thumbnail(_ id: UUID) throws -> Data? {
+    func thumbnail(_ id: UUID) async throws -> Data? {
         try prepare()
+        let sources = try thumbnailSources(id)
+        // 优先使用已保存的像素表示；只有没有内置图片时才读取引用文件。
+        let source = sources.stored.map(ThumbnailSource.stored) ?? sources.referenced.map(ThumbnailSource.referenced)
+        guard let source else { return nil }
+        let usesReference: Bool
+        if case .referenced = source { usesReference = true } else { usesReference = false }
         // 引用可在应用外修改、删除或撤销权限，不按记录 UUID 永久复用旧缩略图。
-        let referencesFile = try scalar("SELECT COUNT(*) FROM representation WHERE entry_id=? AND uti='public.file-url'",
-                                        [.text(id.uuidString)]) > 0
-        if !referencesFile, let cached = thumbnails[id] { return cached }
-        guard let data = try preview(id, thumbnailOnly: true).thumbnail else { return nil }
-        guard data.count <= 2 * 1024 * 1024 else { return nil }
-        if referencesFile { return data }
+        if !usesReference, let cached = thumbnails[id] { return cached }
+        guard let data = await Self.boundedThumbnail(source, maximum: 640), data.count <= 2 * 1024 * 1024 else { return nil }
+        if usesReference { return data }
         while !thumbnailOrder.isEmpty && (thumbnailOrder.count >= 24 || thumbnails.values.reduce(0, { $0 + $1.count }) + data.count > 2 * 1024 * 1024) {
             thumbnails.removeValue(forKey: thumbnailOrder.removeFirst())
         }
         thumbnails[id] = data
         thumbnailOrder.append(id)
         return data
+    }
+
+    /// 只查询候选资产，不读取文件；引用路径的校验与解码在 actor 外执行。
+    private func thumbnailSources(_ id: UUID) throws -> (stored: URL?, referenced: URL?) {
+        let query = try statement("SELECT uti,filename FROM representation WHERE entry_id=? ORDER BY item_order,id", [.text(id.uuidString)])
+        defer { sqlite3_finalize(query) }
+        var stored: URL?
+        var referenced: URL?
+        while sqlite3_step(query) == SQLITE_ROW {
+            let type = text(query, 0)
+            guard let url = assetURL(text(query, 1)) else { continue }
+            if ClipboardFormats.rasterImages.contains(type) {
+                if stored == nil { stored = url }
+            } else if type == "public.file-url", referenced == nil {
+                referenced = url
+            }
+        }
+        return (stored, referenced)
     }
 
     /// 路径必须是 UUID 文件名，拒绝数据库损坏导致的目录穿越。
