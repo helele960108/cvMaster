@@ -1,27 +1,98 @@
 /**
- * 可注入数据的采集策略：隐私基线、表示限额及 item 完整性，不访问系统剪贴板。
+ * 可注入数据的采集策略：两阶段变化游标、隐私基线、表示限额及 item 完整性，不访问系统剪贴板。
  * @author helele
  * @since 2026-10-20
  */
 import Foundation
 
+/// changeCount 表示所有权变化，不保证数据就绪；仅在结果确定后提交对应代数。
+struct ClipboardChangeCursor {
+    struct Attempt: Equatable {
+        let change: Int
+        fileprivate let revision: UInt64
+    }
+
+    enum Observation {
+        case idle, attempt(Attempt), expired
+    }
+
+    enum Resolution { case commit, retryable }
+    enum Completion { case committed, pending, exhausted, stale }
+
+    static let maximumRetries = 3
+    static let retryWindow: Duration = .milliseconds(1500)
+
+    private struct Pending {
+        let attempt: Attempt
+        let started: ContinuousClock.Instant
+        var retries = 0
+    }
+
+    private var committedChange: Int?
+    private var pending: Pending?
+    private var wasBlocked = false
+    private var revision: UInt64 = 0
+
+    mutating func resetBaseline(to change: Int, blocked: Bool) {
+        revision &+= 1
+        committedChange = change
+        pending = nil
+        wasBlocked = blocked
+    }
+
+    /// 只有仍在处理的请求可以推进隐私基线；迟到的失效回调不能吞掉后续复制。
+    @discardableResult
+    mutating func resetBaseline(to change: Int, blocked: Bool, ifPending attempt: Attempt) -> Bool {
+        guard pending?.attempt == attempt else { return false }
+        resetBaseline(to: change, blocked: blocked)
+        return true
+    }
+
+    mutating func observe(change: Int, blocked: Bool, now: ContinuousClock.Instant = .now) -> Observation {
+        if blocked || wasBlocked || committedChange == nil {
+            resetBaseline(to: change, blocked: blocked)
+            return .idle
+        }
+        if pending?.attempt.change != change { pending = nil }
+        guard change != committedChange else { return .idle }
+        if pending == nil {
+            revision &+= 1
+            pending = Pending(attempt: Attempt(change: change, revision: revision), started: now)
+        }
+        guard let pending else { return .idle }
+        if pending.started.duration(to: now) > Self.retryWindow {
+            committedChange = change
+            self.pending = nil
+            return .expired
+        }
+        return .attempt(pending.attempt)
+    }
+
+    /// 请求身份同时绑定基线版本；重置或切换代数后，迟到结果不能提交同计数的新请求。
+    @discardableResult
+    mutating func finish(_ attempt: Attempt, resolution: Resolution,
+                         now: ContinuousClock.Instant = .now) -> Completion {
+        guard var pending, pending.attempt == attempt else { return .stale }
+        if case .retryable = resolution {
+            if pending.retries < Self.maximumRetries,
+               pending.started.duration(to: now) < Self.retryWindow {
+                pending.retries += 1
+                self.pending = pending
+                return .pending
+            }
+            committedChange = attempt.change
+            self.pending = nil
+            return .exhausted
+        }
+        committedChange = attempt.change
+        self.pending = nil
+        return .committed
+    }
+}
+
 enum ClipboardCapturePolicy {
-    struct Gate {
-        private var lastChange: Int?
-        private var wasBlocked = false
-
-        mutating func resetBaseline(to change: Int, blocked: Bool) {
-            lastChange = change
-            wasBlocked = blocked
-        }
-
-        mutating func shouldCapture(change: Int, blocked: Bool) -> Bool {
-            let previous = lastChange
-            let resuming = wasBlocked
-            lastChange = change
-            wasBlocked = blocked
-            return !blocked && !resuming && previous != nil && previous != change
-        }
+    enum ReadResult {
+        case ready(ClipCapture), retryable, ignored
     }
 
     static func isBlocked(sleeping: Bool, sessionInactive: Bool, onConsole: Bool?,
@@ -39,17 +110,23 @@ enum ClipboardCapturePolicy {
 
     /// 数据提供者由调用方注入，策略不访问系统剪贴板，便于使用合成内容验证边界。
     static func capture(itemTypes: [[String]], source: String, bundleID: String,
-                        readData: (Int, String) throws -> Data?) throws -> ClipCapture? {
-        guard !itemTypes.isEmpty else { return nil }
+                        readData: (Int, String) throws -> Data?) throws -> ReadResult {
+        guard !itemTypes.isEmpty else { return .retryable }
         guard itemTypes.count <= StorageLimits.maximumRepresentations else { throw LibraryError.unsupported }
-        guard itemTypes.allSatisfy({ sensitiveTypes.isDisjoint(with: $0) }) else { return nil }
+        guard itemTypes.allSatisfy({ sensitiveTypes.isDisjoint(with: $0) }) else { return .ignored }
+        guard itemTypes.allSatisfy({ !$0.isEmpty }) else { return .retryable }
         var representations: [ClipRepresentation] = []
         var attempted = Array(repeating: Set<String>(), count: itemTypes.count)
+        var unavailableItems = Set<Int>()
+        var missingRequiredData = false
         var size = 0
 
         func boundedData(item: Int, type: String) throws -> Data? {
-            guard let data = try readData(item, type), !data.isEmpty,
-                  data.count <= StorageLimits.maximumRepresentationBytes,
+            guard let data = try readData(item, type) else {
+                unavailableItems.insert(item)
+                return nil
+            }
+            guard !data.isEmpty, data.count <= StorageLimits.maximumRepresentationBytes,
                   data.count <= StorageLimits.maximumCaptureBytes - size else { return nil }
             if type == fileType {
                 guard let value = String(data: data, encoding: .utf8),
@@ -73,8 +150,12 @@ enum ClipboardCapturePolicy {
                 break
             }
             // 可以舍弃同一 item 的超限表示，但不能静默丢掉整个受支持 item。
-            guard represented else { throw LibraryError.unsupported }
+            if !represented {
+                guard unavailableItems.contains(index) else { throw LibraryError.unsupported }
+                missingRequiredData = true
+            }
         }
+        guard !missingRequiredData else { return .retryable }
 
         for (index, types) in itemTypes.enumerated() {
             let allowed = types.contains(fileType) ? ClipboardFormats.rasterImages : preferredTypes
@@ -90,7 +171,7 @@ enum ClipboardCapturePolicy {
                 if isImage { hasImage = true }
             }
         }
-        guard !representations.isEmpty else { return nil }
+        guard !representations.isEmpty else { return .ignored }
         representations.sort {
             if $0.item != $1.item { return $0.item < $1.item }
             return (typeRanks[$0.type] ?? Int.max) < (typeRanks[$1.type] ?? Int.max)
@@ -130,7 +211,7 @@ enum ClipboardCapturePolicy {
         if !files.isEmpty { title = files.count == 1 ? files[0] : "\(files[0]) 等 \(files.count) 个文件" }
         else if hasImage { title = "图片" }
         else { title = String(text.split(whereSeparator: \.isNewline).first ?? "富文本内容") }
-        return ClipCapture(kind: kind, title: String(title.prefix(120)), excerpt: String(searchable.prefix(240)), searchText: searchable,
-                           source: source, sourceBundleID: bundleID, representations: representations)
+        return .ready(ClipCapture(kind: kind, title: String(title.prefix(120)), excerpt: String(searchable.prefix(240)), searchText: searchable,
+                                  source: source, sourceBundleID: bundleID, representations: representations))
     }
 }
