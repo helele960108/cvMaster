@@ -29,6 +29,8 @@ struct QuickPanelView: View {
     @ViewState<Bool> private var resizing = false
     /// 权限横幅仅在本次应用运行内可稍后关闭，下次启动仍会提示。
     @ViewState<Bool> private var permissionBannerDismissed = false
+    /// 仅键盘导航推进滚动版本；鼠标选择不能滚动卡片，否则会打断同一位置的第二次点击。
+    @ViewState<UInt64> private var keyboardSelectionVersion = 0
     /// 搜索焦点，在每次浮层显示时恢复。
     @FocusState private var focused: Bool
     /// 系统设置入口只从次级菜单触发。
@@ -131,8 +133,8 @@ struct QuickPanelView: View {
             TextField(library.timeRange == .all ? "搜索剪贴板…" : "搜索剪贴板… · \(library.timeRange.rawValue)", text: $library.query)
                 .textFieldStyle(.plain).focused($focused)
                 .onSubmit(pasteSelected)
-                .onKeyPress(.downArrow) { dismissPreview(); library.moveSelection(1); return .handled }
-                .onKeyPress(.upArrow) { dismissPreview(); library.moveSelection(-1); return .handled }
+                .onKeyPress(.downArrow) { moveKeyboardSelection(1); return .handled }
+                .onKeyPress(.upArrow) { moveKeyboardSelection(-1); return .handled }
             if !library.query.isEmpty {
                 Button { library.query = "" } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(PanelButtonStyle()).foregroundStyle(.secondary).accessibilityLabel("清除搜索")
@@ -321,35 +323,51 @@ struct QuickPanelView: View {
                             }
                         }.padding(12)
                     }
-                    .onChange(of: library.selection) { if let id = library.selection { proxy.scrollTo(id) } }
+                    // 鼠标单击也会修改 selection，但不得触发滚动；双击期间卡片必须留在原位置。
+                    .onChange(of: keyboardSelectionVersion) {
+                        if let id = library.selection { proxy.scrollTo(id) }
+                    }
                 }
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// 上下键改变选择后才请求滚动；到达边界时不重复定位，避免不必要的布局变化。
+    private func moveKeyboardSelection(_ offset: Int) {
+        dismissPreview()
+        let previous = library.selection
+        library.moveSelection(offset)
+        if library.selection != previous { keyboardSelectionVersion &+= 1 }
+    }
+
     private func row(_ clip: Clip) -> some View {
-        Button {
-            library.selection = clip.id
-        } label: {
-            ClipCardContent(library: library, clip: clip)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(clip.showsImage ? 0 : 13)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(PanelButtonStyle())
-        // 单击只负责定位条目；双击沿用回车与右键菜单的同一个粘贴用例。
-        .simultaneousGesture(
-            TapGesture(count: 2).onEnded {
+        ClipCardContent(library: library, clip: clip)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(clip.showsImage ? 0 : 13)
+        .contentShape(Rectangle())
+        // 登记可见行区域，由窗口内本地鼠标路由识别；不依赖透明层命中或 responder 焦点。
+        .overlay {
+            PanelRowClickTarget(itemID: clip.id, enabled: !library.copying && !library.loading) { doubleClick in
                 guard !library.copying, !library.loading else { return }
+                // 首击即取消悬停预览，避免 280 ms 定时弹层在两次点击之间改变鼠标目标。
+                dismissPreview()
                 library.selection = clip.id
-                library.paste(clip)
+                if doubleClick {
+                    library.paste(clip)
+                }
             }
-        )
+            .accessibilityHidden(true)
+        }
         .disabled(library.copying || library.loading)
         .help("单击选中，双击粘贴到当前激活的 APP；悬停查看预览")
         // 每行只暴露一条合并后的语义，避免图片、来源和类型子元素重复朗读。
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel(for: clip))
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            guard !library.copying, !library.loading else { return }
+            library.selection = clip.id
+        }
         .accessibilityHint("双击粘贴；悬停查看预览")
         .accessibilityAction(named: Text("粘贴")) {
             library.selection = clip.id

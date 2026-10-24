@@ -26,6 +26,135 @@ struct PanelButtonStyle: ButtonStyle {
     }
 }
 
+/// 行区域登记器，不参与命中测试；实际鼠标事件由本应用唯一的本地路由按可见区域处理。
+struct PanelRowClickTarget: NSViewRepresentable {
+    /// 稳定条目标识，防止惰性列表复用后串用上一条目的点击序列。
+    let itemID: UUID
+    /// 内容加载或粘贴期间禁止选中与粘贴。
+    let enabled: Bool
+    /// 首击立即选中，同一条目的系统双击完成后请求粘贴。
+    let clicked: (Bool) -> Void
+
+    func makeNSView(context: Context) -> ClickView {
+        let view = ClickView()
+        view.setAccessibilityElement(false)
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ view: ClickView, context: Context) {
+        if view.itemID != itemID || !enabled { RowMouseRouter.shared.invalidate(view) }
+        view.itemID = itemID
+        view.enabled = enabled
+        view.clicked = clicked
+    }
+
+    static func dismantleNSView(_ view: ClickView, coordinator: ()) {
+        RowMouseRouter.shared.remove(view)
+        view.clicked = nil
+    }
+
+    final class ClickView: NSView {
+        var itemID: UUID?
+        var enabled = false
+        var clicked: ((Bool) -> Void)?
+
+        /// 不覆盖 SwiftUI 的命中结果：滚轮、右键菜单及辅助功能仍由原宿主处理。
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            RowMouseRouter.shared.remove(self)
+            super.viewWillMove(toWindow: newWindow)
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil { RowMouseRouter.shared.add(self) }
+        }
+    }
+
+    /// 一个窗口内路由服务所有可见行，不为每张卡片安装监听，不读取其他进程的输入。
+    @MainActor
+    private final class RowMouseRouter {
+        static let shared = RowMouseRouter()
+        private let rows = NSHashTable<ClickView>.weakObjects()
+        private var monitor: Any?
+        private weak var pressedRow: ClickView?
+        private weak var firstRow: ClickView?
+        private var firstItemID: UUID?
+        private var firstTimestamp: TimeInterval?
+        private var pressedItemID: UUID?
+        private var isDoubleClick = false
+
+        func add(_ row: ClickView) {
+            rows.add(row)
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]) { [weak self] event in
+                MainActor.assumeIsolated { self?.handle(event) }
+                // 只观察本应用派发前的事件；不消费鼠标，宿主仍可正常激活窗口。
+                return event
+            }
+        }
+
+        func remove(_ row: ClickView) {
+            invalidate(row)
+            rows.remove(row)
+            if rows.allObjects.isEmpty, let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+
+        func invalidate(_ row: ClickView) {
+            if pressedRow === row { pressedRow = nil; pressedItemID = nil; isDoubleClick = false }
+            if firstRow === row { firstRow = nil; firstItemID = nil; firstTimestamp = nil }
+        }
+
+        /// 只接受同窗口、未隐藏且落在滚动裁剪后可见范围内的行，不命中离屏 / 遮挡面板。
+        private func row(at event: NSEvent) -> ClickView? {
+            guard let window = event.window, window.isVisible, window.attachedSheet == nil,
+                  !event.modifierFlags.contains(.control) else { return nil }
+            return rows.allObjects.first { row in
+                row.window === window && row.enabled && !row.isHiddenOrHasHiddenAncestor
+                    && row.visibleRect.contains(row.convert(event.locationInWindow, from: nil))
+            }
+        }
+
+        private func handle(_ event: NSEvent) {
+            switch event.type {
+            case .leftMouseDown:
+                let row = row(at: event)
+                pressedRow = row
+                pressedItemID = row?.itemID
+                isDoubleClick = event.clickCount == 2 && row != nil && row === firstRow
+                    && row?.itemID == firstItemID && firstTimestamp.map {
+                        event.timestamp - $0 <= NSEvent.doubleClickInterval
+                    } == true
+                if event.clickCount == 1, let row {
+                    firstRow = row
+                    firstItemID = row.itemID
+                    firstTimestamp = event.timestamp
+                } else {
+                    firstRow = nil; firstItemID = nil; firstTimestamp = nil
+                }
+                // 立即选中，不等 mouseUp，更不要求当前 responder 或上次选中项先变更。
+                row?.clicked?(false)
+            case .leftMouseDragged:
+                pressedRow = nil; pressedItemID = nil; isDoubleClick = false
+                firstRow = nil; firstItemID = nil; firstTimestamp = nil
+            case .leftMouseUp:
+                let target = pressedRow
+                let paste = isDoubleClick && target != nil && target === row(at: event)
+                    && target?.itemID == pressedItemID
+                pressedRow = nil; pressedItemID = nil; isDoubleClick = false
+                if paste { target?.clicked?(true) }
+            default:
+                break
+            }
+        }
+    }
+}
+
 /// 原生手柄将高频鼠标事件限制为至多一个待执行更新，松开时立即提交最后尺寸。
 struct PanelResizeHandle: NSViewRepresentable {
     /// 手柄所在边决定拖动方向：顶部手柄向上拖增高，底部手柄向下拖增高。
