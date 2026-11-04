@@ -16,7 +16,8 @@ public enum LibraryErrorCode
     PlainTextUnavailable,
     RichTextTooLarge,
     PasteTargetUnavailable,
-    PasteTargetNotReady
+    PasteTargetNotReady,
+    MissingGroup
 }
 
 public sealed class LibraryException : Exception
@@ -43,6 +44,7 @@ public sealed class LibraryException : Exception
         LibraryErrorCode.MissingContent => "内容文件不可用，无法再次复制。",
         LibraryErrorCode.UnavailableFile => "原文件已移动、删除或无权访问，无法复制文件引用。",
         LibraryErrorCode.NameConflict => "分组名称为空、过长或已存在。",
+        LibraryErrorCode.MissingGroup => "分组已不存在，请重新选择。",
         LibraryErrorCode.PlainTextUnavailable => "此记录没有可用的纯文本或富文本表示，无法移除格式；原始剪贴板未改变。",
         LibraryErrorCode.RichTextTooLarge => "RTF 超过 256 KB 纯文本转换预算，未改变剪贴板；仍可使用普通粘贴保留原格式。",
         LibraryErrorCode.PasteTargetNotReady => "未能激活目标应用；剪贴板未改变，请重新打开列表后重试。",

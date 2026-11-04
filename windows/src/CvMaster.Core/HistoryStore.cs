@@ -48,7 +48,11 @@ public sealed class HistoryStore : IAsyncDisposable
         RunAsync(() => StorageStatsCore(), cancellationToken);
 
     public Task<IReadOnlyList<ClipGroup>> GetGroupsAsync(CancellationToken cancellationToken = default) =>
-        RunAsync(() => (IReadOnlyList<ClipGroup>)ReadGroupsCore(), cancellationToken);
+        RunAsync(() =>
+        {
+            EnsureInitialized();
+            return (IReadOnlyList<ClipGroup>)ReadGroupsCore();
+        }, cancellationToken);
 
     public Task SaveAsync(ClipCapture capture, int retentionDays, CancellationToken cancellationToken = default) =>
         RunAsync(() => SaveCore(capture, retentionDays), cancellationToken);
@@ -87,6 +91,24 @@ public sealed class HistoryStore : IAsyncDisposable
         {
             EnsureInitialized();
             SaveGroupCore(id, name);
+            return true;
+        }, cancellationToken);
+
+    /// <summary>仅删除分组及其归属关系；缺失分组按成功处理，不触发内容或资产清理。</summary>
+    public Task DeleteGroupAsync(Guid id, CancellationToken cancellationToken = default) =>
+        RunAsync(() =>
+        {
+            EnsureInitialized();
+            DeleteGroupCore(id);
+            return true;
+        }, cancellationToken);
+
+    /// <summary>按最新目录将分组前移或后移一位；仅接受 -1 / +1，首尾越界不写入。</summary>
+    public Task MoveGroupAsync(Guid id, int offset, CancellationToken cancellationToken = default) =>
+        RunAsync(() =>
+        {
+            EnsureInitialized();
+            MoveGroupCore(id, offset);
             return true;
         }, cancellationToken);
 
@@ -805,48 +827,136 @@ public sealed class HistoryStore : IAsyncDisposable
         return removed;
     }
 
+    /// <summary>分组校验和写入共用显式写事务；事务开始后不再检查取消。</summary>
+    private void RunGroupTransaction(Action work)
+    {
+        try
+        {
+            using (var begin = CreateCommand("BEGIN IMMEDIATE"))
+            {
+                begin.ExecuteNonQuery();
+            }
+
+            work();
+
+            using var commit = CreateCommand("COMMIT");
+            commit.ExecuteNonQuery();
+        }
+        catch (LibraryException)
+        {
+            TryRollback();
+            throw;
+        }
+        catch (Exception exception)
+        {
+            TryRollback();
+            throw new LibraryException(LibraryErrorCode.Storage, exception);
+        }
+    }
+
     private void SaveGroupCore(Guid? id, string name)
     {
-        var trimmed = name.Trim();
-        var length = TextExtraction.CountTextElements(trimmed);
-        var groups = ReadGroupsCore();
-        if (length == 0 || length > StorageLimits.MaximumGroupNameCharacters ||
-            (id is null && groups.Count >= StorageLimits.MaximumGroups) ||
-            groups.Any(group => group.Id != id && NamesEqual(group.Name, trimmed)))
+        RunGroupTransaction(() =>
         {
-            throw new LibraryException(LibraryErrorCode.NameConflict);
-        }
-
-        if (id is { } groupId)
-        {
-            if (!groups.Any(group => group.Id == groupId))
+            // 先限制原名的字节预算，避免超长空白或组合字符绕过 trim / 文本元素限额。
+            if (name.Length > StorageLimits.MaximumGroupNameBytes ||
+                Encoding.UTF8.GetByteCount(name) > StorageLimits.MaximumGroupNameBytes)
             {
                 throw new LibraryException(LibraryErrorCode.NameConflict);
             }
 
-            using var update = CreateCommand(
-                "UPDATE user_group SET name=@name WHERE id=@id",
-                ("@name", trimmed),
-                ("@id", groupId.ToString("D")));
-            update.ExecuteNonQuery();
-            return;
-        }
+            var trimmed = name.Trim();
+            if (Encoding.UTF8.GetByteCount(trimmed) > StorageLimits.MaximumGroupNameBytes)
+            {
+                throw new LibraryException(LibraryErrorCode.NameConflict);
+            }
 
-        var position = ScalarLong("SELECT COALESCE(MAX(position),-1)+1 FROM user_group");
-        using var insert = CreateCommand(
-            "INSERT INTO user_group(id,name,color,position) VALUES(@id,@name,@color,@position)",
-            ("@id", Guid.NewGuid().ToString("D")),
-            ("@name", trimmed),
-            ("@color", groups.Count % 4),
-            ("@position", position));
-        insert.ExecuteNonQuery();
+            var length = TextExtraction.CountTextElements(trimmed);
+            if (length == 0 || length > StorageLimits.MaximumGroupNameCharacters)
+            {
+                throw new LibraryException(LibraryErrorCode.NameConflict);
+            }
+
+            var groups = ReadGroupsCore();
+            if (id is { } existingId && !groups.Any(group => group.Id == existingId))
+            {
+                throw new LibraryException(LibraryErrorCode.MissingGroup);
+            }
+
+            if ((id is null && groups.Count >= StorageLimits.MaximumGroups) ||
+                groups.Any(group => group.Id != id && GroupNames.Equal(group.Name, trimmed)))
+            {
+                throw new LibraryException(LibraryErrorCode.NameConflict);
+            }
+
+            if (id is { } groupId)
+            {
+                using var update = CreateCommand(
+                    "UPDATE user_group SET name=@name WHERE id=@id",
+                    ("@name", trimmed),
+                    ("@id", groupId.ToString("D")));
+                update.ExecuteNonQuery();
+                return;
+            }
+
+            var position = ScalarLong("SELECT COALESCE(MAX(position),-1)+1 FROM user_group");
+            using var insert = CreateCommand(
+                "INSERT INTO user_group(id,name,color,position) VALUES(@id,@name,@color,@position)",
+                ("@id", Guid.NewGuid().ToString("D")),
+                ("@name", trimmed),
+                ("@color", groups.Count % 4),
+                ("@position", position));
+            insert.ExecuteNonQuery();
+        });
     }
 
-    private static bool NamesEqual(string left, string right) =>
-        CultureInfo.InvariantCulture.CompareInfo.Compare(
-            left,
-            right,
-            CompareOptions.IgnoreCase | CompareOptions.IgnoreWidth) == 0;
+    private void DeleteGroupCore(Guid id)
+    {
+        RunGroupTransaction(() =>
+        {
+            // 仅由外键级联解除关系，不删除历史、表示或资产，也不触发保留期清理。
+            using var delete = CreateCommand(
+                "DELETE FROM user_group WHERE id=@id",
+                ("@id", id.ToString("D")));
+            delete.ExecuteNonQuery();
+        });
+    }
+
+    private void MoveGroupCore(Guid id, int offset)
+    {
+        if (offset is not (-1 or 1))
+        {
+            throw new LibraryException(LibraryErrorCode.Storage);
+        }
+
+        RunGroupTransaction(() =>
+        {
+            // 持有写锁后重读，以稳定 GUID 定位，不能使用可能陈旧的 UI 索引。
+            var groups = ReadGroupsCore();
+            var index = groups.FindIndex(group => group.Id == id);
+            if (index < 0)
+            {
+                throw new LibraryException(LibraryErrorCode.MissingGroup);
+            }
+
+            var destination = index + offset;
+            if (destination < 0 || destination >= groups.Count)
+            {
+                return;
+            }
+
+            (groups[index], groups[destination]) = (groups[destination], groups[index]);
+            for (var position = 0; position < groups.Count; position++)
+            {
+                using var update = CreateCommand(
+                    "UPDATE user_group SET position=@position WHERE id=@id",
+                    ("@position", position),
+                    ("@id", groups[position].Id.ToString("D")));
+                update.ExecuteNonQuery();
+            }
+        });
+    }
+
 
     private List<ClipRepresentation> RepresentationsCore(Guid id)
     {
@@ -1096,50 +1206,50 @@ public sealed class HistoryStore : IAsyncDisposable
             {
                 case "text/plain":
                 case "text/url":
-                {
-                    var remaining = StorageLimits.MaximumPreviewTextBytes - text.Length;
-                    if (remaining <= 0)
                     {
-                        truncated = true;
-                        continue;
-                    }
+                        var remaining = StorageLimits.MaximumPreviewTextBytes - text.Length;
+                        if (remaining <= 0)
+                        {
+                            truncated = true;
+                            continue;
+                        }
 
-                    var data = ReadFilePrefix(path, remaining * 4 + 4);
-                    if (data is not null)
-                    {
-                        value = Encoding.UTF8.GetString(data);
-                    }
+                        var data = ReadFilePrefix(path, remaining * 4 + 4);
+                        if (data is not null)
+                        {
+                            value = Encoding.UTF8.GetString(data);
+                        }
 
-                    break;
-                }
+                        break;
+                    }
                 case "text/rtf":
-                {
-                    if (richTextBudget <= 0)
                     {
-                        truncated = true;
-                        continue;
-                    }
+                        if (richTextBudget <= 0)
+                        {
+                            truncated = true;
+                            continue;
+                        }
 
-                    var data = ReadFilePrefix(path, richTextBudget);
-                    if (data is not null)
-                    {
-                        richTextBudget -= data.Length;
-                        value = TextExtraction.FromRtf(data);
-                    }
+                        var data = ReadFilePrefix(path, richTextBudget);
+                        if (data is not null)
+                        {
+                            richTextBudget -= data.Length;
+                            value = TextExtraction.FromRtf(data);
+                        }
 
-                    break;
-                }
+                        break;
+                    }
                 case "text/html":
-                {
-                    var data = ReadFilePrefix(path, Math.Min(StorageLimits.MaximumRichTextPreviewBytes, richTextBudget));
-                    if (data is not null)
                     {
-                        richTextBudget -= data.Length;
-                        value = TextExtraction.FromHtml(data);
-                    }
+                        var data = ReadFilePrefix(path, Math.Min(StorageLimits.MaximumRichTextPreviewBytes, richTextBudget));
+                        if (data is not null)
+                        {
+                            richTextBudget -= data.Length;
+                            value = TextExtraction.FromHtml(data);
+                        }
 
-                    break;
-                }
+                        break;
+                    }
             }
 
             if (value is null)

@@ -24,6 +24,7 @@ public static class StorageLimits
     public const int MaximumTitleCharacters = 120;
     public const int MaximumExcerptCharacters = 240;
     public const int MaximumGroupNameCharacters = 20;
+    public const int MaximumGroupNameBytes = 1024;
     public const int MaximumGroups = 100;
     public const int MaximumFileReferences = 100;
 

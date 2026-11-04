@@ -6,7 +6,10 @@
  */
 using System.Text;
 using CvMaster.Core;
+using CvMaster.SmokeTests;
+using Microsoft.Data.Sqlite;
 
+var groupsOnly = args.Contains("--groups-only", StringComparer.Ordinal);
 var checks = 0;
 var failures = new List<string>();
 var root = Path.Combine(Path.GetTempPath(), "cvMaster-smoke-" + Guid.NewGuid().ToString("N"));
@@ -64,9 +67,9 @@ static async Task<HistoryPage> PageAsync(HistoryStore store, string query = "", 
     return result;
 }
 
-await using var store = new HistoryStore(root);
-try
+async Task RunCoreAsync()
 {
+    await using var store = new HistoryStore(root);
     Console.WriteLine("Core smoke tests");
     await store.InitializeAsync();
     Check("数据库初始化创建 sqlite 文件", File.Exists(store.DatabasePath));
@@ -221,20 +224,43 @@ try
     var htmlWithSource2 = HtmlPayload("Same Body", "https://example.com/two");
     Check("HTML 头部提取稳定", TextExtraction.GetHtmlBody(htmlWithSource1).AsSpan().SequenceEqual(TextExtraction.GetHtmlBody(htmlWithSource2)));
 }
-catch (Exception exception)
+
+async Task RunSuiteAsync(string name, Func<Task> suite)
 {
-    failures.Add("未处理异常: " + exception);
-    Console.WriteLine(exception);
+    try
+    {
+        await suite();
+    }
+    catch (Exception exception)
+    {
+        failures.Add(name + " 未处理异常: " + exception);
+        Console.WriteLine(exception);
+    }
+}
+
+try
+{
+    if (!groupsOnly)
+    {
+        await RunSuiteAsync("Core", RunCoreAsync);
+    }
+
+    await RunSuiteAsync("Groups", () => GroupChecks.RunAsync(
+        Path.Combine(root, "groups"), Check, Capture,
+        (groupStore, scope) => PageAsync(groupStore, scope: scope)));
 }
 finally
 {
+    // 每个 suite 已退出其 await using；关闭 SQLite 池后才删除自建临时目录。
+    SqliteConnection.ClearAllPools();
     try
     {
         Directory.Delete(root, recursive: true);
     }
-    catch (IOException)
+    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
     {
-        // 临时目录清理失败不影响验证结论。
+        Check("临时目录清理（全部存储连接已释放）", false);
+        Console.WriteLine($"  临时目录清理失败: {exception.GetType().Name}");
     }
 }
 
