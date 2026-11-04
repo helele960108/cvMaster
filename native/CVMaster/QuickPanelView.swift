@@ -6,6 +6,26 @@
 import AppKit
 import SwiftUI
 
+/// 删除目标在弹窗打开时固定，避免异步完成或筛选变化误删其他对象。
+private enum PanelDeleteRequest {
+    case entry(UUID)
+    case group(ClipGroup)
+
+    var title: String {
+        switch self {
+        case .entry: "删除记录？"
+        case .group(let group): "删除分组“\(group.name)”？"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .entry: "将删除此条历史记录，不删除引用的原文件。"
+        case .group: "仅删除此分组及其分组关系，不会删除历史记录或原文件。记录仍可在“全部”和其他所属分组中查看。"
+        }
+    }
+}
+
 struct QuickPanelView: View {
     /// 当前有界历史投影，原始内容由后台存储按需读取。
     @ObservedObject var library: ClipboardLibrary
@@ -21,10 +41,8 @@ struct QuickPanelView: View {
     @ViewState<UUID?> private var groupID = nil
     /// 尚未保存的分组名称。
     @ViewState<String> private var groupName = ""
-    /// 待删除条目标识，确认前不更改数据。
-    @ViewState<UUID?> private var pendingDelete = nil
-    /// 删除确认状态。
-    @ViewState<Bool> private var deleting = false
+    /// 记录和分组共用原生确认入口，取消或关闭时统一清理请求。
+    @ViewState<PanelDeleteRequest?> private var pendingDelete = nil
     /// 拖动期间暂停侧边预览，避免浮层重新锚定干扰连续调整。
     @ViewState<Bool> private var resizing = false
     /// 权限横幅仅在本次应用运行内可稍后关闭，下次启动仍会提示。
@@ -61,7 +79,7 @@ struct QuickPanelView: View {
         .background(.regularMaterial)
         // 统一继承 AppKit 外观，避免撤销 SwiftUI 颜色偏好时内容仍停留在旧主题。
         .onAppear { library.reconcileSelection(); dismissPreview(); focused = true }
-        .onDisappear { dismissPreview() }
+        .onDisappear { dismissPreview(); pendingDelete = nil }
         .onChange(of: library.query) { dismissPreview() }
         .onChange(of: library.scope) { dismissPreview() }
         .onChange(of: library.kind) { dismissPreview() }
@@ -72,18 +90,27 @@ struct QuickPanelView: View {
         }
         .onChange(of: library.clips.map(\.id)) { dismissPreview() }
         .onChange(of: editingGroup) { if editingGroup { dismissPreview() } }
-        .onChange(of: deleting) { if deleting { dismissPreview() } }
+        .onChange(of: pendingDelete != nil) { if pendingDelete != nil { dismissPreview() } }
         // 写入剪贴板前解除 SwiftUI 搜索焦点，避免原生关闭后焦点绑定再次激活搜索框。
         .onChange(of: library.copying) { if library.copying { focused = false; dismissPreview() } }
-        .onExitCommand(perform: close)
+        .onExitCommand {
+            if pendingDelete != nil { pendingDelete = nil }
+            else if editingGroup { editingGroup = false }
+            else { close() }
+        }
         .sheet(isPresented: $editingGroup) { groupEditor }
-        .alert("确认删除？", isPresented: $deleting) {
+        .alert(pendingDelete?.title ?? "确认删除？", isPresented: deleteConfirmation, presenting: pendingDelete) { request in
             Button("取消", role: .cancel) { pendingDelete = nil }
             Button("删除", role: .destructive) {
-                if let pendingDelete { library.delete(pendingDelete) }
+                switch request {
+                case .entry(let id): library.delete(id)
+                case .group(let group): library.deleteGroup(group.id)
+                }
                 pendingDelete = nil
-                library.reconcileSelection()
             }
+            .disabled(deletingGroup && library.changingGroups)
+        } message: { request in
+            Text(request.message)
         }
     }
 
@@ -110,8 +137,9 @@ struct QuickPanelView: View {
                     library.paused.toggle()
                 }
                 Button("新建分组…", systemImage: "folder.badge.plus") { editGroup(nil) }
-                if let id = UUID(uuidString: library.scope) {
-                    Button("重命名当前分组…", systemImage: "pencil") { editGroup(id) }
+                    .disabled(library.changingGroups)
+                if let group = library.groups.first(where: { $0.id.uuidString == library.scope }) {
+                    Menu("当前分组", systemImage: "folder") { groupActions(group) }
                 }
                 Divider()
                 Button("设置…", systemImage: "gearshape") {
@@ -153,7 +181,12 @@ struct QuickPanelView: View {
                     HStack(spacing: 4) {
                         scopeChip("全部", scope: "all")
                         scopeChip("置顶", scope: "pinned")
-                        ForEach(library.groups) { scopeChip($0.name, scope: $0.id.uuidString) }
+                        ForEach(library.groups) { group in
+                            scopeChip(group.name, scope: group.id.uuidString)
+                                .contextMenu { groupActions(group) }
+                                .accessibilityValue("用户分组第 \((library.groups.firstIndex { $0.id == group.id } ?? 0) + 1) 个，共 \(library.groups.count) 个")
+                                .accessibilityHint("右键管理分组，也可使用更多菜单中的当前分组")
+                        }
                     }
                 }
                 .accessibilityElement(children: .contain)
@@ -169,6 +202,7 @@ struct QuickPanelView: View {
                 .buttonStyle(PanelButtonStyle())
                 .help("新建分组")
                 .accessibilityLabel("新建分组")
+                .disabled(library.changingGroups)
             }
             HStack(spacing: 4) {
                 typeChip(nil)
@@ -413,13 +447,15 @@ struct QuickPanelView: View {
                             else { Text(group.name) }
                         }
                         .accessibilityValue(included ? "已加入" : "未加入")
+                        .disabled(library.changingGroups)
                     }
                 }
                 Divider()
                 Button("新建分组…", systemImage: "folder.badge.plus") { editGroup(nil) }
+                    .disabled(library.changingGroups)
             }
             Divider()
-            Button("删除记录…", systemImage: "trash", role: .destructive) { pendingDelete = clip.id; deleting = true }
+            Button("删除记录…", systemImage: "trash", role: .destructive) { pendingDelete = .entry(clip.id) }
         }
     }
 
@@ -519,7 +555,43 @@ struct QuickPanelView: View {
         if let clip = library.selectedClip { library.paste(clip) }
     }
 
+    private var deleteConfirmation: Binding<Bool> {
+        Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })
+    }
+
+    private var deletingGroup: Bool {
+        if case .group = pendingDelete { return true }
+        return false
+    }
+
+    /// 胶囊右键和顶部菜单共用操作；固定的“全部 / 置顶”从不进入此路径。
+    @ViewBuilder
+    private func groupActions(_ group: ClipGroup) -> some View {
+        let index = library.groups.firstIndex { $0.id == group.id }
+        Button("重命名…", systemImage: "pencil") { editGroup(group.id) }
+            .disabled(library.changingGroups || index == nil)
+        Button("前移", systemImage: "arrow.left") {
+            dismissPreview()
+            library.moveGroup(group.id, offset: -1)
+        }
+        .disabled(library.changingGroups || index == nil || index == 0)
+        Button("后移", systemImage: "arrow.right") {
+            dismissPreview()
+            library.moveGroup(group.id, offset: 1)
+        }
+        .disabled(library.changingGroups || index == nil || index == library.groups.count - 1)
+        Divider()
+        Button("删除分组…", systemImage: "trash", role: .destructive) {
+            dismissPreview()
+            pendingDelete = .group(group)
+        }
+        .disabled(library.changingGroups || index == nil)
+    }
+
     private func editGroup(_ id: UUID?) {
+        guard !library.changingGroups else { return }
+        if let id, !library.groups.contains(where: { $0.id == id }) { return }
+        dismissPreview()
         groupID = id
         groupName = library.groups.first { $0.id == id }?.name ?? ""
         editingGroup = true
@@ -536,14 +608,14 @@ struct QuickPanelView: View {
                 Button("保存") {
                     library.saveGroup(groupID, name: groupName)
                     editingGroup = false
-                }.disabled(!validName).keyboardShortcut(.defaultAction)
+                }.disabled(!validName || library.changingGroups).keyboardShortcut(.defaultAction)
             }
         }.padding(20).frame(width: 300)
     }
 
     private var validName: Bool {
-        let name = groupName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !name.isEmpty && name.count <= 20 && !library.groups.contains {
+        guard let name = MetadataBounds.normalizedGroupName(groupName) else { return false }
+        return !library.groups.contains {
             $0.id != groupID && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
         }
     }

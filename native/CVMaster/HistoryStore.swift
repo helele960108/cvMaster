@@ -137,21 +137,12 @@ actor HistoryStore {
             return
         }
         do {
-            let directory: URL
-            if let directoryOverride {
-                guard directoryOverride.isFileURL else { throw LibraryError.storage }
-                directory = directoryOverride
-            } else {
-                directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                    appropriateFor: nil, create: true).appendingPathComponent("cvMaster", isDirectory: true)
-            }
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
-            rootDescriptor = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            try secureDirectory(rootDescriptor)
-            if mkdirat(rootDescriptor, "assets", 0o700) != 0, errno != EEXIST { throw LibraryError.storage }
-            assetsDescriptor = openat(rootDescriptor, "assets", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            try secureDirectory(assetsDescriptor)
+            let directory = try StoragePaths.applicationDirectory(directory: directoryOverride)
+            rootDescriptor = StoragePaths.retryOnInterrupt { Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            try StoragePaths.secureDirectory(rootDescriptor)
+            if StoragePaths.retryOnInterrupt({ mkdirat(rootDescriptor, "assets", 0o700) }) != 0, errno != EEXIST { throw LibraryError.storage }
+            assetsDescriptor = StoragePaths.retryOnInterrupt { openat(rootDescriptor, "assets", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
+            try StoragePaths.secureDirectory(assetsDescriptor)
             // 在 SQLite 打开前创建 0600 普通文件，避免先暴露内容再 chmod 的时间窗口。
             try secureDatabaseFile("history.sqlite", create: true)
             try hardenSidecars()
@@ -222,28 +213,21 @@ actor HistoryStore {
         }
     }
 
-    private func secureDirectory(_ descriptor: Int32) throws {
-        var info = stat()
-        guard descriptor >= 0, fstat(descriptor, &info) == 0,
-              (info.st_mode & S_IFMT) == S_IFDIR, info.st_uid == getuid(),
-              fchmod(descriptor, 0o700) == 0 else { throw LibraryError.storage }
-    }
-
     /// 拒绝准备后 root/assets 被替换为其他 inode；资产 I/O 仍相对已打开描述符执行。
     private func verifyDirectories() throws {
         guard let root else { throw LibraryError.storage }
         var openedRoot = stat(), pathRoot = stat(), openedAssets = stat(), pathAssets = stat()
         guard fstat(rootDescriptor, &openedRoot) == 0, lstat(root.path, &pathRoot) == 0,
               (pathRoot.st_mode & S_IFMT) == S_IFDIR,
-              openedRoot.st_dev == pathRoot.st_dev, openedRoot.st_ino == pathRoot.st_ino,
+              StoragePaths.sameIdentity(openedRoot, pathRoot),
               fstat(assetsDescriptor, &openedAssets) == 0,
               fstatat(rootDescriptor, "assets", &pathAssets, AT_SYMLINK_NOFOLLOW) == 0,
               (pathAssets.st_mode & S_IFMT) == S_IFDIR,
-              openedAssets.st_dev == pathAssets.st_dev, openedAssets.st_ino == pathAssets.st_ino else {
+              StoragePaths.sameIdentity(openedAssets, pathAssets) else {
             throw LibraryError.storage
         }
-        try secureDirectory(rootDescriptor)
-        try secureDirectory(assetsDescriptor)
+        try StoragePaths.secureDirectory(rootDescriptor)
+        try StoragePaths.secureDirectory(assetsDescriptor)
     }
 
     private func secureDatabaseFile(_ name: String, create: Bool = false) throws {
@@ -400,9 +384,17 @@ actor HistoryStore {
         return value
     }
 
-    private func text(_ query: OpaquePointer, _ column: Int32) -> String {
+    private func text(_ query: OpaquePointer, _ column: Int32, maximumBytes: Int = StorageLimits.searchableBytes,
+                      maximumCharacters: Int? = nil, rejectOversized: Bool = false) -> String {
         guard let value = sqlite3_column_text(query, column) else { return "" }
-        return String(decoding: UnsafeBufferPointer(start: value, count: Int(sqlite3_column_bytes(query, column))), as: UTF8.self)
+        let count = Int(sqlite3_column_bytes(query, column))
+        if rejectOversized {
+            guard count <= maximumBytes else { return "" }
+            // 身份字段不可截成另一个值；有界原始字节必须完整且合法，损坏身份直接置空。
+            return String(bytes: UnsafeBufferPointer(start: value, count: count), encoding: .utf8) ?? ""
+        }
+        return BoundedText.decode(UnsafeBufferPointer(start: value, count: count),
+                                  maximumBytes: maximumBytes, maximumCharacters: maximumCharacters)
     }
 
     /// 3 个及以上码点使用 trigram 候选，仍以转义 LIKE 精确复核；短查询保持子串扫描。
@@ -423,8 +415,8 @@ actor HistoryStore {
             clauses.append("e.copied_at>=? AND e.copied_at<?")
             values += [.real(interval.start.timeIntervalSince1970), .real(interval.end.timeIntervalSince1970)]
         }
-        if !query.isEmpty {
-            let term = String(query.prefix(256))
+        let term = MetadataBounds.query(query)
+        if !term.isEmpty {
             let escaped = term.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
             if hasTrigram, term.unicodeScalars.count >= 3, !term.contains("\0") {
@@ -448,12 +440,15 @@ actor HistoryStore {
             defer { sqlite3_finalize(queryStatement) }
             while try next(queryStatement) {
                 try Task.checkCancellation()
-                guard let id = UUID(uuidString: text(queryStatement, 0)) else { throw LibraryError.storage }
-                clips.append(Clip(id: id, kind: ClipKind.fromStorageValue(text(queryStatement, 1)),
-                    title: text(queryStatement, 2), source: text(queryStatement, 4), sourceBundleID: text(queryStatement, 9),
+                guard let id = UUID(uuidString: text(queryStatement, 0, maximumBytes: 36, rejectOversized: true)) else { throw LibraryError.storage }
+                clips.append(Clip(id: id, kind: ClipKind.fromStorageValue(text(queryStatement, 1, maximumBytes: 32)),
+                    title: text(queryStatement, 2, maximumBytes: StorageLimits.titleBytes, maximumCharacters: StorageLimits.titleCharacters),
+                    source: text(queryStatement, 4, maximumBytes: StorageLimits.sourceBytes),
+                    sourceBundleID: text(queryStatement, 9, maximumBytes: StorageLimits.sourceBundleIDBytes, rejectOversized: true),
                     copiedAt: Date(timeIntervalSince1970: sqlite3_column_double(queryStatement, 5)),
                     byteSize: Int(sqlite3_column_int64(queryStatement, 6)), pinned: sqlite3_column_int(queryStatement, 7) != 0,
-                    groups: [], copies: Int(sqlite3_column_int(queryStatement, 8)), excerpt: text(queryStatement, 3),
+                    groups: [], copies: Int(sqlite3_column_int(queryStatement, 8)),
+                    excerpt: text(queryStatement, 3, maximumBytes: StorageLimits.excerptBytes, maximumCharacters: StorageLimits.excerptCharacters),
                     hasFileReference: sqlite3_column_int(queryStatement, 10) != 0))
             }
         }
@@ -505,7 +500,9 @@ actor HistoryStore {
         var groups: [ClipGroup] = []
         while try next(query) {
             guard let id = UUID(uuidString: text(query, 0)) else { throw LibraryError.storage }
-            groups.append(ClipGroup(id: id, name: text(query, 1), colorIndex: Int(sqlite3_column_int(query, 2))))
+            groups.append(ClipGroup(id: id,
+                name: text(query, 1, maximumBytes: StorageLimits.groupNameBytes, maximumCharacters: StorageLimits.groupNameCharacters),
+                colorIndex: Int(sqlite3_column_int(query, 2))))
         }
         return groups
     }
@@ -514,17 +511,18 @@ actor HistoryStore {
     private func readableCapture(_ capture: ClipCapture) -> ClipCapture {
         guard capture.kind == .text, capture.searchText.isEmpty else { return capture }
         var remaining = ClipboardFormats.maximumRichTextPreviewBytes
-        var strings: [String] = []
+        var output = BoundedText.Builder()
         for part in capture.representations where part.type == "public.rtf" {
-            guard part.data.count <= remaining else { break }
+            guard !output.isFull, part.data.count <= remaining else { break }
             remaining -= part.data.count
-            if let value = ClipboardFormats.richText(part.data) { strings.append(value) }
+            if let value = ClipboardFormats.richText(part.data) { output.append(value) }
         }
-        let value = String(strings.joined(separator: "\n").prefix(StorageLimits.searchableCharacters))
+        let value = output.value
         guard !value.isEmpty else { return capture }
-        return ClipCapture(kind: capture.kind, title: String(value.split(whereSeparator: \.isNewline).first?.prefix(120) ?? "富文本内容"),
-            excerpt: String(value.prefix(240)), searchText: value, source: capture.source,
-            sourceBundleID: capture.sourceBundleID, representations: capture.representations)
+        return MetadataBounds.normalize(ClipCapture(kind: capture.kind,
+            title: String(value.split(maxSplits: 1, whereSeparator: \.isNewline).first ?? "富文本内容"),
+            excerpt: value, searchText: value, source: capture.source,
+            sourceBundleID: capture.sourceBundleID, representations: capture.representations))
     }
 
     /// 清理与入库共享一个事务；失败不删除旧元数据 / 资产，提交后才 unlink 被回收的文件。
@@ -535,7 +533,7 @@ actor HistoryStore {
               original.representations.allSatisfy({ $0.data.count <= StorageLimits.maximumRepresentationBytes }) else { throw LibraryError.unsupported }
         let bytes = original.representations.reduce(0) { $0 + $1.data.count }
         guard bytes <= StorageLimits.maximumCaptureBytes else { throw LibraryError.unsupported }
-        let capture = readableCapture(original)
+        let capture = readableCapture(MetadataBounds.normalize(original))
         var hasher = SHA256()
         for representation in capture.representations {
             hasher.update(data: Data("\(representation.item):\(representation.type):\(representation.data.count):".utf8))
@@ -552,6 +550,12 @@ actor HistoryStore {
                 if duplicate {
                     try execute("UPDATE entry SET copied_at=?,copies=copies+1,source=?,source_bundle_id=? WHERE fingerprint=?",
                         [.real(Date().timeIntervalSince1970), .text(capture.source), .text(capture.sourceBundleID), .text(fingerprint)])
+                    // 仅修复发生变化的派生元数据；普通重复复制不触发 search_text 的 FTS 重建写入。
+                    try execute("""
+                        UPDATE entry SET title=?,excerpt=?,search_text=? WHERE fingerprint=?
+                            AND (title<>? OR excerpt<>? OR search_text<>?)
+                        """, [.text(capture.title), .text(capture.excerpt), .text(capture.searchText), .text(fingerprint),
+                              .text(capture.title), .text(capture.excerpt), .text(capture.searchText)])
                 }
                 let pruned = try prune(retention: retention, incoming: duplicate ? 0 : bytes, addingEntry: !duplicate)
                 removed = pruned.filenames
@@ -560,7 +564,7 @@ actor HistoryStore {
                     let id = UUID().uuidString
                     try execute("INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,source_bundle_id,copied_at,byte_size) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         [.text(id), .text(fingerprint), .text(capture.kind.storageValue), .text(capture.title), .text(capture.excerpt),
-                         .text(String(capture.searchText.prefix(StorageLimits.searchableCharacters))), .text(capture.source), .text(capture.sourceBundleID),
+                         .text(capture.searchText), .text(capture.source), .text(capture.sourceBundleID),
                          .real(Date().timeIntervalSince1970), .integer(bytes)])
                     for representation in capture.representations {
                         let name = UUID().uuidString
@@ -709,14 +713,43 @@ actor HistoryStore {
 
     func saveGroup(_ id: UUID?, name: String) throws {
         try prepare()
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let groups = try readGroups()
-        guard !trimmed.isEmpty, trimmed.count <= 20, groups.count < 100 || id != nil,
-              !groups.contains(where: { $0.id != id && $0.name.localizedCaseInsensitiveCompare(trimmed) == .orderedSame }) else { throw LibraryError.nameConflict }
-        if let id { try execute("UPDATE user_group SET name=? WHERE id=?", [.text(trimmed), .text(id.uuidString)]) }
-        else {
-            try execute("INSERT INTO user_group(id,name,color,position) VALUES(?,?,?,?)",
-                [.text(UUID().uuidString), .text(trimmed), .integer(groups.count % 4), .integer(groups.count)])
+        guard let trimmed = MetadataBounds.normalizedGroupName(name) else { throw LibraryError.nameConflict }
+        try transaction {
+            let groups = try readGroups()
+            if let id, !groups.contains(where: { $0.id == id }) { throw LibraryError.missingGroup }
+            guard groups.count < 100 || id != nil,
+                  !groups.contains(where: { $0.id != id && $0.name.localizedCaseInsensitiveCompare(trimmed) == .orderedSame }) else { throw LibraryError.nameConflict }
+            if let id {
+                try execute("UPDATE user_group SET name=? WHERE id=?", [.text(trimmed), .text(id.uuidString)])
+            } else {
+                let position = try scalar("SELECT COALESCE(MAX(position),-1)+1 FROM user_group")
+                try execute("INSERT INTO user_group(id,name,color,position) VALUES(?,?,?,?)",
+                    [.text(UUID().uuidString), .text(trimmed), .integer(groups.count % 4), .integer(position)])
+            }
+        }
+    }
+
+    /// 外键仅解除此分组的归属，不删除历史、原始表示或引用文件，也不触发保留期清理。
+    func deleteGroup(_ id: UUID) throws {
+        try prepare()
+        try transaction {
+            try execute("DELETE FROM user_group WHERE id=?", [.text(id.uuidString)])
+        }
+    }
+
+    /// 以事务中的最新目录计算相邻位置，不接收可能过期的 UI 索引或完整目录快照。
+    func moveGroup(_ id: UUID, offset: Int) throws {
+        try prepare()
+        guard offset == -1 || offset == 1 else { throw LibraryError.storage }
+        try transaction {
+            var groups = try readGroups()
+            guard let index = groups.firstIndex(where: { $0.id == id }) else { throw LibraryError.missingGroup }
+            let destination = index + offset
+            guard groups.indices.contains(destination) else { return }
+            groups.swapAt(index, destination)
+            for (position, group) in groups.enumerated() {
+                try execute("UPDATE user_group SET position=? WHERE id=?", [.integer(position), .text(group.id.uuidString)])
+            }
         }
     }
 
@@ -837,18 +870,20 @@ actor HistoryStore {
                             value = reference.lastPathComponent
                         }
                     } else if ["public.utf8-plain-text", "public.url"].contains(type) {
-                        if let data = try? assetData(name, maximum: max(1, remaining + 1)), !data.isEmpty {
-                            value = String(decoding: data, as: UTF8.self)
+                        // 额外读取最多一个 scalar，不能把读取边界切断的有效 UTF-8 误判为损坏数据。
+                        if let data = try? assetData(name, maximum: max(4, remaining + 4)), !data.isEmpty {
+                            value = BoundedText.decode(data, maximumBytes: max(0, remaining))
+                            if data.count > max(0, remaining) { truncated = true }
                         }
                     } else if type == "public.rtf", let data = try? assetData(name, maximum: richTextBudget + 1), data.count <= richTextBudget {
                         richTextBudget -= data.count
-                        value = ClipboardFormats.richText(data)
+                        value = ClipboardFormats.richText(data, maximumBytes: max(4, remaining + 4), maximumCharacters: nil)
+                        if let value, value.utf8.count > max(0, remaining) { truncated = true }
                     }
                     if let value, !value.isEmpty {
                         textItems.insert(item)
                         if remaining > 0 {
-                            var bounded = String(decoding: value.utf8.prefix(remaining), as: UTF8.self)
-                            while bounded.utf8.count > remaining { bounded.removeLast() }
+                            let bounded = BoundedText.prefix(value, maximumBytes: remaining)
                             preview += separator + bounded
                             if bounded != value { truncated = true }
                         } else { truncated = true }
@@ -999,46 +1034,49 @@ actor HistoryStore {
         }
     }
 
-    /// 完整验证引用扫描后才回收；只 unlink UUID 普通文件 / 链接，不递归删除目录或未知文件。
-    private func recoverAssets() throws {
+    /// BEGIN IMMEDIATE 覆盖完整引用扫描和 unlink，阻止另一连接在扫描后提交新资产引用。
+    /// 删除自身已先提交；维护失败仍由调用者记录延后，不伪装删除回滚。checkpoint 在事务外。
+    func recoverAssets() throws {
         guard assetsDescriptor >= 0 else { throw LibraryError.storage }
-        let query = try statement("SELECT filename FROM representation")
-        var referenced: Set<String> = []
-        do {
-            defer { sqlite3_finalize(query) }
-            while try next(query) {
-                let name = text(query, 0)
-                guard UUID(uuidString: name) != nil else { throw LibraryError.storage }
-                referenced.insert(name)
+        try transaction {
+            let query = try statement("SELECT filename FROM representation")
+            var referenced: Set<String> = []
+            do {
+                defer { sqlite3_finalize(query) }
+                while try next(query) {
+                    let name = text(query, 0, maximumBytes: 36, rejectOversized: true)
+                    guard UUID(uuidString: name) != nil else { throw LibraryError.storage }
+                    referenced.insert(name)
+                }
             }
-        }
-        let duplicate = dup(assetsDescriptor)
-        guard duplicate >= 0 else { throw LibraryError.storage }
-        guard let directory = fdopendir(duplicate) else { Darwin.close(duplicate); throw LibraryError.storage }
-        defer { closedir(directory) }
-        // dup 共享目录位置，每次扫描前重置，否则清空后的扫描可能从 EOF 开始。
-        rewinddir(directory)
-        while true {
-            errno = 0
-            guard let item = readdir(directory) else {
-                guard errno == 0 else { throw LibraryError.storage }
-                break
+            let duplicate = dup(assetsDescriptor)
+            guard duplicate >= 0 else { throw LibraryError.storage }
+            guard let directory = fdopendir(duplicate) else { Darwin.close(duplicate); throw LibraryError.storage }
+            defer { closedir(directory) }
+            // dup 共享目录位置，每次扫描前重置，否则清空后的扫描可能从 EOF 开始。
+            rewinddir(directory)
+            while true {
+                errno = 0
+                guard let item = readdir(directory) else {
+                    guard errno == 0 else { throw LibraryError.storage }
+                    break
+                }
+                let name = withUnsafePointer(to: &item.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+                }
+                guard UUID(uuidString: name) != nil else { continue }
+                if !referenced.contains(name) { unlinkAssets([name]); continue }
+                // 已有资产也收紧权限；不 chmod 链接、目录、其他所有者或多硬链接文件。
+                let descriptor = openat(assetsDescriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                if descriptor < 0 { continue }
+                var info = stat()
+                let regular = fstat(descriptor, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+                if regular, info.st_uid == getuid(), info.st_nlink == 1 {
+                    let status = fchmod(descriptor, 0o600)
+                    Darwin.close(descriptor)
+                    guard status == 0 else { throw LibraryError.storage }
+                } else { Darwin.close(descriptor) }
             }
-            let name = withUnsafePointer(to: &item.pointee.d_name) {
-                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
-            }
-            guard UUID(uuidString: name) != nil else { continue }
-            if !referenced.contains(name) { unlinkAssets([name]); continue }
-            // 已有资产也收紧权限；不 chmod 链接、目录、其他所有者或多硬链接文件。
-            let descriptor = openat(assetsDescriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-            if descriptor < 0 { continue }
-            var info = stat()
-            let regular = fstat(descriptor, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
-            if regular, info.st_uid == getuid(), info.st_nlink == 1 {
-                let status = fchmod(descriptor, 0o600)
-                Darwin.close(descriptor)
-                guard status == 0 else { throw LibraryError.storage }
-            } else { Darwin.close(descriptor) }
         }
     }
 }

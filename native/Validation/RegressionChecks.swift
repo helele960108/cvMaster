@@ -5,6 +5,7 @@
  * since: 2026-10-20
  */
 import Foundation
+import Carbon
 import SQLite3
 import Darwin
 
@@ -128,14 +129,19 @@ private struct RegressionChecks {
             // Preserve runner's physical path: Foundation standardization can reintroduce /var or /tmp aliases.
             let root = URL(fileURLWithPath: arguments[1], isDirectory: true)
             try validateWorkspace(root)
+            if try SingleInstanceChecks.runHelperIfRequested(arguments: Array(arguments.dropFirst(2)), workspace: root) { return }
             let options = Set(arguments.dropFirst(2))
             try require(options.isSubset(of: ["--benchmark", "--benchmark-large"]), "Unknown harness option")
             print("All fixtures are synthetic; no application or clipboard lifecycle is instantiated.")
             let checks: [(String, (URL) async throws -> Void)] = [
+                ("single-instance lifetime locks, subprocess races and unsafe targets", SingleInstanceChecks.run),
                 ("stable kind keys and v3 migration", migration),
+                ("Unicode metadata byte bounds, aggregate capture and legacy projections", metadataBounds),
+                ("asset recovery excludes uncommitted writer assets", recoveryIsolation),
                 ("capture round trips, duplicate statistics and preserved metadata", roundTrips),
                 ("literal LIKE / trigram / forced fallback semantic parity", searchParity),
                 ("batched group projection, totals and date/kind/scope limits", groupsAndFilters),
+                ("group deletion, ordering, persistence and atomic rollback", groupManagement),
                 ("pruning rollback and protected retention", pruningRollback),
                 ("private metadata/assets and symlink attacks fail closed", privacy),
                 ("RTF conversion budgets and raw/plain-text recovery", richText),
@@ -143,6 +149,7 @@ private struct RegressionChecks {
                 ("thumbnail deduplication, deadline, cancellation and worker cap", thumbnails),
                 ("two-phase clipboard cursor, bounded retries and delayed data", captureCursor),
                 ("pure privacy gate and per-item capture budgets", capturePolicy),
+                ("default shortcut, saved preferences and reset round trips", globalShortcut),
                 ("pure paste handoff request binding and focus transitions", pasteHandoff),
                 ("pure paste focus restoration single-use permits and cancellation", pasteFocusRestoration)
             ]
@@ -262,12 +269,18 @@ private struct RegressionChecks {
         try insertRows(directory, zip(ids, kinds).enumerated().map {
             (id: $0.element.0, kind: $0.element.1, text: "migration-\($0.offset)", date: Double(100 + $0.offset))
         })
-        let group = UUID()
+        let group = UUID(), earlierGroup = UUID(), middleGroup = UUID()
+        let legacyGroups: [[String]]
         do {
             let db = try FixtureDatabase(directory)
-            let statement = try db.prepare("INSERT INTO user_group(id,name,color,position) VALUES(?,?,0,0)")
+            let statement = try db.prepare("INSERT INTO user_group(id,name,color,position) VALUES(?,?,?,?)")
             defer { sqlite3_finalize(statement) }
-            try db.run(statement, values: [group.uuidString, "Migration Group"])
+            for values in [[group.uuidString, "Migration Alpha", "2", "40"],
+                           [earlierGroup.uuidString, "Migration Zulu", "3", "3"],
+                           [middleGroup.uuidString, "Migration Middle", "1", "17"]] {
+                try db.run(statement, values: values)
+            }
+            legacyGroups = try db.rows("SELECT id,name,color,position FROM user_group ORDER BY position,id")
             try db.execute("UPDATE entry SET pinned=1,copies=7 WHERE id='\(ids[0].uuidString)'")
             try db.execute("INSERT INTO entry_group VALUES('\(ids[0].uuidString)','\(group.uuidString)')")
         }
@@ -280,6 +293,13 @@ private struct RegressionChecks {
         try require(preserved.sourceBundleID == "local.synthetic.validation", "Migration lost source bundle identity")
         let db = try FixtureDatabase(directory)
         try require(try db.integer("PRAGMA user_version") == 4, "Expected schema v4")
+        try require(try db.rows("SELECT id,name,color,position FROM user_group ORDER BY position,id") == legacyGroups,
+                    "Migration changed legacy group metadata, positions or catalog order")
+        try require(try await store.groupCatalog().map(\.id) == [earlierGroup, middleGroup, group],
+                    "Migrated group catalog ignored persisted positions")
+        let reopened = HistoryStore(directory: directory)
+        try require(try await reopened.groupCatalog().map(\.id) == [earlierGroup, middleGroup, group],
+                    "Reopening migrated history changed group catalog order")
         for (id, kind) in zip(ids.prefix(4), ClipKind.allCases) {
             try require(try db.rows("SELECT kind FROM entry WHERE id=?", [id.uuidString]).first?.first == kind.storageValue,
                         "Migration did not use stable English key")
@@ -319,6 +339,12 @@ private struct RegressionChecks {
         let groups = try await store.groupCatalog()
         try await store.setGroup(textID, group: groups[0].id, included: true)
         try await store.setPinned(textID, true)
+        let duplicateDB = try FixtureDatabase(directory)
+        try duplicateDB.execute("""
+            CREATE TRIGGER unchanged_search_guard BEFORE UPDATE OF search_text ON entry
+            WHEN old.search_text=new.search_text BEGIN SELECT RAISE(ABORT,'Unnecessary search index update'); END;
+            """)
+        defer { try? duplicateDB.execute("DROP TRIGGER unchanged_search_guard") }
         try await store.save(capture("unique plain text 中文", source: "Synthetic Again"), retention: 0)
         let after = try await page(store)
         let duplicate = after.clips.first(where: { $0.id == textID })!
@@ -330,7 +356,7 @@ private struct RegressionChecks {
     }
 
     private static func likePattern(_ query: String) -> String {
-        let escaped = String(query.prefix(256)).replacingOccurrences(of: "\\", with: "\\\\")
+        let escaped = MetadataBounds.query(query).replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
         return "%\(escaped)%"
     }
@@ -370,7 +396,8 @@ private struct RegressionChecks {
         let queries = ["", "needle", "NEEDLE", "100%", "%", "_", "\\", "/", "\"", "'", "\"quote\"", "a-b",
                        "中文", "子串测", "汉", "a", "ab", "XY", "Z", "中", "文", "😀", "😀🙃🙂", "\n", "\r\n",
                        "first\nsecond", "École", "école", "Ä", "ä", "STRASSE", "e\u{301}", "é", "%_\\", "OR *", "NOT AND",
-                       "no-synthetic-match-zzzz", String(repeating: "x", count: 257)]
+                       "no-synthetic-match-zzzz", String(repeating: "x", count: 257),
+                       "e" + String(repeating: "\u{301}", count: 10_000)]
         let db = try FixtureDatabase(normalDirectory)
         for query in queries {
             let expected = try referenceIDs(db, query: query)
@@ -429,6 +456,235 @@ private struct RegressionChecks {
         try require(removed.total == 39 && !removed.clips.contains(where: { $0.id == rows[0].id }), "Group removal did not update scope")
         try require(try await page(store, limit: 0).clips.count == 1, "Minimum page limit was not bounded")
         try require(try await page(store, limit: Int.max).clips.count == 80, "Large limit lost rows")
+    }
+
+    /// Every group fixture lives beneath the runner-owned directory, including referenced originals.
+    private static func groupManagement(_ directory: URL) async throws {
+        try await groupDeletion(child(directory, "deletion"))
+        try await groupOrdering(child(directory, "ordering"))
+    }
+
+    private static func requireGroupOrder(_ store: HistoryStore, _ db: FixtureDatabase,
+                                          _ ids: [UUID]) async throws {
+        try require(try await store.groupCatalog().map(\.id) == ids, "Group catalog order differs from requested order")
+        let positions = try db.rows("SELECT id,position FROM user_group ORDER BY position,id")
+        try require(positions == ids.enumerated().map { [$0.element.uuidString, String($0.offset)] },
+                    "Moved group positions are not atomic, unique and continuous from zero")
+    }
+
+    private static func groupDeletion(_ directory: URL) async throws {
+        let store = HistoryStore(directory: directory)
+        let external = directory.appendingPathComponent("keep-group-original.txt")
+        let externalBytes = Data("external group original must survive".utf8)
+        try externalBytes.write(to: external)
+        let rich = [ClipRepresentation(item: 0, type: "public.utf8-plain-text", data: Data("group raw text 中文".utf8)),
+                    ClipRepresentation(item: 0, type: "public.rtf", data: rtf(16)),
+                    ClipRepresentation(item: 1, type: "public.utf8-plain-text", data: Data("second raw item".utf8))]
+        try await store.save(capture("shared protected entry", representations: rich), retention: 0)
+        try await store.save(capture("keep-group-original.txt", kind: .file,
+            representations: [ClipRepresentation(item: 0, type: "public.file-url", data: Data(external.absoluteString.utf8))]), retention: 0)
+        try await store.save(capture("other group entry"), retention: 0)
+        let entries = try await page(store)
+        let shared = entries.clips.first { $0.title == "shared protected entry" }!.id
+        let file = entries.clips.first { $0.kind == .file }!.id
+        let other = entries.clips.first { $0.title == "other group entry" }!.id
+        for name in ["Delete populated", "Keep memberships", "Delete empty"] {
+            try await store.saveGroup(nil, name: name)
+        }
+        let catalog = try await store.groupCatalog()
+        let removed = catalog[0].id, kept = catalog[1].id, empty = catalog[2].id
+        try await store.setGroup(shared, group: removed, included: true)
+        try await store.setGroup(file, group: removed, included: true)
+        try await store.setGroup(shared, group: kept, included: true)
+        try await store.setGroup(other, group: kept, included: true)
+        try await store.setPinned(shared, true)
+        try await store.markCopied(shared)
+        try await store.markCopied(shared)
+        let db = try FixtureDatabase(directory)
+        try db.execute("UPDATE entry SET copied_at=1 WHERE id='\(file.uuidString)'")
+        let before = try await page(store)
+        let entryRows = try db.rows("SELECT * FROM entry ORDER BY id")
+        let representationRows = try db.rows("SELECT * FROM representation ORDER BY id")
+        let groupRows = try db.rows("SELECT * FROM user_group ORDER BY id")
+        let memberships = try db.rows("SELECT * FROM entry_group ORDER BY entry_id,group_id")
+        let assets = directory.appendingPathComponent("assets", isDirectory: true)
+        // A valid UUID orphan would be collected by cleanup; group-only edits must not invoke it.
+        let orphan = assets.appendingPathComponent(UUID().uuidString)
+        try Data("group edits must not run asset cleanup".utf8).write(to: orphan)
+        var assetBytes: [String: Data] = [:]
+        for name in try FileManager.default.contentsOfDirectory(atPath: assets.path) {
+            assetBytes[name] = try Data(contentsOf: assets.appendingPathComponent(name))
+        }
+        try db.execute("""
+            CREATE TRIGGER validation_group_delete_fail AFTER DELETE ON user_group
+            WHEN old.id='\(removed.uuidString)' BEGIN SELECT RAISE(FAIL,'synthetic group delete failure'); END;
+            """)
+        try await expectError(.storage) { try await store.deleteGroup(removed) }
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == groupRows
+                    && db.rows("SELECT * FROM entry_group ORDER BY entry_id,group_id") == memberships,
+                    "Failed group deletion lost its definition or cascaded memberships")
+        try requireSamePage(before, try await page(store))
+        try db.execute("DROP TRIGGER validation_group_delete_fail")
+
+        try await store.deleteGroup(empty)
+        let withoutEmpty = try db.rows("SELECT * FROM user_group ORDER BY id")
+        try await store.deleteGroup(empty)
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == withoutEmpty,
+                    "Repeated empty-group deletion changed the catalog")
+        try requireSamePage(before, try await page(store))
+        try await store.deleteGroup(removed)
+        try await store.deleteGroup(removed)
+        try require(try await store.groupCatalog().map(\.id) == [kept], "Deleting populated group removed another definition")
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == groupRows.filter { $0[0] == kept.uuidString },
+                    "Group deletion changed another group's name, color or position")
+        try require(try db.rows("SELECT * FROM entry_group ORDER BY entry_id,group_id") == memberships.filter { $0[1] != removed.uuidString },
+                    "Populated-group deletion changed other group memberships")
+        let after = try await page(store)
+        try require(after.total == before.total && after.storedEntries == before.storedEntries && after.storedBytes == before.storedBytes,
+                    "Deleting a group deleted entries or changed storage totals")
+        try require(after.clips.first { $0.id == shared }.map { $0.pinned && $0.copies == 3 && $0.groups == [kept] } == true,
+                    "Deleting a group lost pinned state, copies or shared membership")
+        try require(after.clips.first { $0.id == file }?.groups.isEmpty == true,
+                    "Deleting a file's last membership removed the entry or retained the relation")
+        try require(try await page(store, scope: removed.uuidString).total == 0, "Deleted group scope still returns entries")
+        try require(try await page(store, scope: kept.uuidString).total == 2, "Other group scope lost shared entries")
+        try await expectError(.missingGroup) { try await store.saveGroup(removed, name: "No resurrection") }
+        for offset in [-1, 1] {
+            try await expectError(.missingGroup) { try await store.moveGroup(removed, offset: offset) }
+        }
+        try await store.deleteGroup(kept)
+        try await store.deleteGroup(kept)
+        try await store.deleteGroup(UUID())
+        try require(try await store.groupCatalog().isEmpty, "Last-group deletion left a definition or recreated a deleted group")
+        try require(try db.rows("SELECT * FROM entry_group").isEmpty, "Last-group deletion left memberships")
+        try require(try db.rows("SELECT * FROM entry ORDER BY id") == entryRows
+                    && db.rows("SELECT * FROM representation ORDER BY id") == representationRows,
+                    "Group-only edits changed entry metadata, copies, pins or representation records")
+        let remaining = try await page(store)
+        try require(remaining.total == before.total && remaining.storedBytes == before.storedBytes,
+                    "Last-group deletion pruned unprotected history or invalidated storage totals")
+        try require(Set(try FileManager.default.contentsOfDirectory(atPath: assets.path)) == Set(assetBytes.keys),
+                    "Group deletion removed content assets or ran orphan cleanup")
+        for (name, bytes) in assetBytes {
+            try require(try Data(contentsOf: assets.appendingPathComponent(name)) == bytes, "Group deletion changed asset bytes")
+        }
+        for clip in remaining.clips {
+            let originals = try await store.representations(clip.id)
+            try require(originals.count == representationRows.filter { $0[1] == clip.id.uuidString }.count,
+                        "Group deletion broke raw representation recovery")
+            for original in originals {
+                let row = representationRows.first { $0[1] == clip.id.uuidString && $0[2] == String(original.item) && $0[3] == original.type }!
+                try require(original.data == assetBytes[row[4]], "Group deletion changed recovered raw representation bytes")
+            }
+        }
+        try require(try Data(contentsOf: external) == externalBytes, "Group deletion changed an externally referenced file")
+        try require(try db.rows("PRAGMA foreign_key_check").isEmpty, "Group deletion left broken foreign keys")
+        try require(try db.rows("PRAGMA integrity_check").first?.first == "ok", "Group deletion damaged SQLite integrity")
+    }
+
+    private static func groupOrdering(_ directory: URL) async throws {
+        let store = HistoryStore(directory: directory)
+        for name in ["Zulu", "Alpha", "Middle", "Tail"] { try await store.saveGroup(nil, name: name) }
+        let initial = try await store.groupCatalog()
+        let a = initial[0].id, b = initial[1].id, c = initial[2].id, d = initial[3].id
+        let db = try FixtureDatabase(directory)
+        try await requireGroupOrder(store, db, [a, b, c, d])
+        try await store.save(capture("ordering preserves entry"), retention: 0)
+        let entry = try await page(store).clips[0].id
+        try await store.setGroup(entry, group: c, included: true)
+        try await store.setGroup(entry, group: d, included: true)
+        let preservedPage = try await page(store)
+        let originalRows = try db.rows("SELECT id,color,position FROM user_group ORDER BY position,id")
+        try await store.saveGroup(c, name: "  Renamed  ")
+        try require(try await store.groupCatalog().first { $0.id == c }?.name == "Renamed", "Group rename was not normalized")
+        try require(try db.rows("SELECT id,color,position FROM user_group ORDER BY position,id") == originalRows,
+                    "Rename changed group identity, color or ordering")
+        let renamedRows = try db.rows("SELECT * FROM user_group ORDER BY id")
+        try await expectError(.nameConflict) { try await store.saveGroup(c, name: "zulu") }
+        try await expectError(.nameConflict) { try await store.saveGroup(nil, name: "ZULU") }
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == renamedRows, "Name conflict partially changed groups")
+        // FAIL leaves changes made by the statement intact unless the API really rolls its transaction back.
+        try db.execute("""
+            CREATE TRIGGER validation_group_insert_fail AFTER INSERT ON user_group
+            BEGIN SELECT RAISE(FAIL,'synthetic group insert failure'); END;
+            """)
+        try await expectError(.storage) { try await store.saveGroup(nil, name: "Must roll back") }
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == renamedRows, "Failed group creation was not rolled back")
+        try db.execute("DROP TRIGGER validation_group_insert_fail")
+        try db.execute("""
+            CREATE TRIGGER validation_group_rename_fail AFTER UPDATE OF name ON user_group
+            BEGIN SELECT RAISE(FAIL,'synthetic group rename failure'); END;
+            """)
+        try await expectError(.storage) { try await store.saveGroup(c, name: "Must also roll back") }
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == renamedRows, "Failed group rename was not rolled back")
+        try db.execute("DROP TRIGGER validation_group_rename_fail")
+        try db.execute("""
+            UPDATE user_group SET position=CASE id WHEN '\(a.uuidString)' THEN 4 WHEN '\(b.uuidString)' THEN 10
+                WHEN '\(c.uuidString)' THEN 30 ELSE 70 END;
+            """)
+        try await store.saveGroup(nil, name: "Newest")
+        let e = try await store.groupCatalog().last!.id
+        try require(try await store.groupCatalog().map(\.id) == [a, b, c, d, e], "New group was inserted into a position hole instead of at the end")
+        try require(try db.integer("SELECT position FROM user_group WHERE id=?", [e.uuidString]) == 71,
+                    "Group creation used count instead of MAX(position)+1")
+        try await store.moveGroup(a, offset: 1)
+        try await requireGroupOrder(store, db, [b, a, c, d, e])
+        try await store.moveGroup(a, offset: -1)
+        try await requireGroupOrder(store, db, [a, b, c, d, e])
+        try await store.moveGroup(e, offset: -1)
+        try await requireGroupOrder(store, db, [a, b, c, e, d])
+        try await store.moveGroup(e, offset: 1)
+        try await requireGroupOrder(store, db, [a, b, c, d, e])
+        let orderedRows = try db.rows("SELECT * FROM user_group ORDER BY id")
+        try await store.moveGroup(a, offset: -1)
+        try await store.moveGroup(e, offset: 1)
+        for offset in [0, -2, 2, Int.min, Int.max] {
+            try await expectError(.storage) { try await store.moveGroup(c, offset: offset) }
+        }
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == orderedRows, "Boundary or invalid-offset move changed positions")
+        try db.execute("""
+            CREATE TABLE validation_group_moves(n INTEGER NOT NULL);
+            INSERT INTO validation_group_moves VALUES(0);
+            CREATE TRIGGER validation_group_move_fail AFTER UPDATE OF position ON user_group BEGIN
+                UPDATE validation_group_moves SET n=n+1;
+                SELECT CASE WHEN (SELECT n FROM validation_group_moves)=2
+                    THEN RAISE(FAIL,'synthetic mid-move failure') END;
+            END;
+            """)
+        try await expectError(.storage) { try await store.moveGroup(a, offset: 1) }
+        try require(try db.rows("SELECT * FROM user_group ORDER BY id") == orderedRows
+                    && db.integer("SELECT n FROM validation_group_moves") == 0,
+                    "Mid-move failure left partial positions or committed trigger side effects")
+        try await requireGroupOrder(store, db, [a, b, c, d, e])
+        try db.execute("DROP TRIGGER validation_group_move_fail; DROP TABLE validation_group_moves;")
+        try await store.moveGroup(a, offset: 1)
+        try await store.moveGroup(a, offset: -1)
+        let otherStore = HistoryStore(directory: directory)
+        // The original store already observed c at index 2; another writer moves it before this request.
+        try await otherStore.moveGroup(c, offset: -1)
+        try await store.moveGroup(c, offset: -1)
+        try await requireGroupOrder(store, db, [c, a, b, d, e])
+        try await otherStore.deleteGroup(a)
+        try await store.moveGroup(b, offset: 1)
+        try await requireGroupOrder(store, db, [c, d, b, e])
+        try await expectError(.missingGroup) { try await store.saveGroup(a, name: "Deleted elsewhere") }
+        try await expectError(.missingGroup) { try await store.moveGroup(a, offset: 1) }
+        try requireSamePage(preservedPage, try await page(store))
+        let persisted = try db.rows("SELECT * FROM user_group ORDER BY position,id")
+        let reopened = HistoryStore(directory: directory)
+        try await requireGroupOrder(reopened, db, [c, d, b, e])
+        try require(try db.rows("SELECT * FROM user_group ORDER BY position,id") == persisted, "Reopening changed persisted group metadata or positions")
+        for id in [c, d, b] { try await store.deleteGroup(id) }
+        let singleton = try db.rows("SELECT * FROM user_group")
+        try await store.moveGroup(e, offset: -1)
+        try await store.moveGroup(e, offset: 1)
+        try require(try await store.groupCatalog().map(\.id) == [e] && db.rows("SELECT * FROM user_group") == singleton,
+                    "Single-group boundary moves changed the group or its persisted position")
+        try await store.deleteGroup(e)
+        try await store.saveGroup(nil, name: "Restart at zero")
+        try await requireGroupOrder(store, db, try await store.groupCatalog().map(\.id))
+        try require(try db.rows("PRAGMA foreign_key_check").isEmpty, "Group ordering left broken foreign keys")
+        try require(try db.rows("PRAGMA integrity_check").first?.first == "ok", "Group ordering damaged SQLite integrity")
     }
 
     private static func pruningRollback(_ directory: URL) async throws {
@@ -623,6 +879,17 @@ private struct RegressionChecks {
         try require(smallPage.total == 1, "Small RTF was not extracted for search")
         let smallText = try await store.plainText(smallPage.clips[0].id, kind: .text)
         try require(String(data: smallText[0].data, encoding: .utf8) == String(repeating: "s", count: 12), "Small RTF conversion failed")
+        let truncatedRTF = rtf(20_000, character: "z")
+        try await store.save(ClipCapture(kind: .text, title: "preview truncation", excerpt: "", searchText: "", source: "Synthetic",
+                                        sourceBundleID: "", representations: [ClipRepresentation(item: 0, type: "public.rtf", data: truncatedRTF)]), retention: 0)
+        let truncatedID = try await page(store, query: String(repeating: "z", count: 12)).clips[0].id
+        let truncatedPreview = try await store.preview(truncatedID)
+        try require(truncatedPreview.text.hasPrefix(String(repeating: "z", count: 16_000))
+                    && truncatedPreview.text.contains("预览已截断") && truncatedPreview.text.utf8.count <= 16_384,
+                    "RTF preview omitted its truncation notice or exceeded the detail budget")
+        let completeRTF = try await store.plainText(truncatedID, kind: .text)
+        try require(completeRTF[0].data == Data(String(repeating: "z", count: 20_000).utf8),
+                    "Preview metadata budget truncated plain-text RTF recovery")
         let mixed = [ClipRepresentation(item: 0, type: "public.rtf", data: oversized),
                      ClipRepresentation(item: 0, type: "public.utf8-plain-text", data: Data("preferred text".utf8))]
         try await store.save(capture("preferred text", representations: mixed), retention: 0)
@@ -641,21 +908,35 @@ private struct RegressionChecks {
         let entries = try await page(store)
         let old = entries.clips.first(where: { $0.kind == .file })!.id
         try await store.saveGroup(nil, name: "Survives clear")
+        try await store.saveGroup(nil, name: "Empty group retained")
+        try await store.saveGroup(nil, name: "Tail group retained")
+        let originalCatalog = try await store.groupCatalog()
+        try await store.moveGroup(originalCatalog[0].id, offset: 1)
+        try await store.moveGroup(originalCatalog[2].id, offset: -1)
         let catalog = try await store.groupCatalog()
         try await store.setGroup(old, group: catalog[0].id, included: true)
         try await store.setPinned(old, true)
+        let db = try FixtureDatabase(directory)
+        let groupRows = try db.rows("SELECT id,name,color,position FROM user_group ORDER BY position,id")
         do {
-            let db = try FixtureDatabase(directory)
             let statement = try db.prepare("UPDATE entry SET copied_at=? WHERE id=?")
             defer { sqlite3_finalize(statement) }
             try db.run(statement, values: ["1", old.uuidString])
         }
         try require(try await store.clear(before: Date(timeIntervalSince1970: 2)) == 1, "Date clear must remove even protected old rows")
         try require(try await page(store).total == 1, "Date clear removed wrong count")
+        try require(try await store.groupCatalog().map(\.id) == catalog.map(\.id)
+                    && db.rows("SELECT id,name,color,position FROM user_group ORDER BY position,id") == groupRows,
+                    "Date clear changed group definitions or reordered the catalog")
         try require(try await store.clear() == 1, "Clear returned wrong count")
         let empty = try await page(store)
         try require(empty.total == 0 && empty.storedEntries == 0 && empty.storedBytes == 0, "Clear left stale statistics")
-        try require(try await store.groupCatalog().map(\.id) == catalog.map(\.id), "Clear deleted group definitions")
+        try require(try await store.groupCatalog().map(\.id) == catalog.map(\.id)
+                    && db.rows("SELECT id,name,color,position FROM user_group ORDER BY position,id") == groupRows,
+                    "Clear deleted group definitions or changed their persisted order")
+        let reopened = HistoryStore(directory: directory)
+        try require(try await reopened.groupCatalog().map(\.id) == catalog.map(\.id), "Reopening cleared history changed group order")
+        try require(try db.rows("SELECT * FROM entry_group").isEmpty, "Clear left group relations to deleted entries")
         try require(try FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("assets").path).isEmpty,
                     "Clear left orphan assets")
         try require(try String(contentsOf: external, encoding: .utf8) == "external synthetic file", "Clear deleted referenced original")
@@ -974,6 +1255,35 @@ private struct RegressionChecks {
     }
 
     /// Pure event sequences reproduce await-time focus races without AppKit, AX, or a running app.
+    private static func globalShortcut(_: URL) async throws {
+        let expected = GlobalShortcut(keyCode: UInt32(kVK_ANSI_V),
+                                      modifiers: UInt32(cmdKey) | UInt32(shiftKey), label: "V")
+        try require(GlobalShortcut.defaultShortcut == expected, "Default shortcut must be Command-Shift-V")
+        try require(expected.display == "⇧⌘V", "Default shortcut display must use macOS modifier order")
+        try require(expected.validationMessage == nil, "Command-Shift-V must pass shortcut validation")
+
+        let suite = "cvMaster.RegressionChecks.GlobalShortcut.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw CheckFailure("Cannot create isolated shortcut preferences")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try require(GlobalShortcut.load(from: defaults) == expected, "Unset preferences must use the new default")
+
+        let savedShortcuts = [
+            GlobalShortcut(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey), label: "Space"),
+            GlobalShortcut(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(controlKey) | UInt32(shiftKey), label: "H")
+        ]
+        for shortcut in savedShortcuts {
+            shortcut.save(to: defaults)
+            try require(GlobalShortcut.load(from: defaults) == shortcut, "Saved shortcuts must not be overwritten by the new default")
+        }
+        GlobalShortcut.defaultShortcut.save(to: defaults)
+        try require(GlobalShortcut.load(from: defaults) == expected, "Reset default must persist Command-Shift-V")
+
+        let commandV = GlobalShortcut(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(cmdKey), label: "V")
+        try require(commandV.validationMessage != nil, "Command-V alone must still be rejected")
+    }
+
     private static func pasteHandoff(_: URL) async throws {
         let own: Int32 = 1_001, original: Int32 = 2_002, unrelated: Int32 = 3_003
         let target = UUID(), otherTarget = UUID()
@@ -1383,6 +1693,191 @@ private struct RegressionChecks {
         }
     }
 
+    private static func requireBoundedMetadata(_ value: ClipCapture) throws {
+        try require(value.title.utf8.count <= 4_096 && value.title.count <= 120, "Capture title exceeds metadata bounds")
+        try require(value.excerpt.utf8.count <= 8_192 && value.excerpt.count <= 240, "Capture excerpt exceeds metadata bounds")
+        try require(value.searchText.utf8.count <= 131_072 && value.searchText.count <= 32_768,
+                    "Capture search text exceeds shared output bounds")
+        try require(value.source.utf8.count <= 1_024 && value.sourceBundleID.utf8.count <= 1_024,
+                    "Capture source metadata exceeds bounds")
+    }
+
+    private static func requireBoundedClip(_ value: Clip) throws {
+        try require(value.title.utf8.count <= 4_096 && value.title.count <= 120, "Page title exceeds metadata bounds")
+        try require(value.excerpt.utf8.count <= 8_192 && value.excerpt.count <= 240, "Page excerpt exceeds metadata bounds")
+        try require(value.source.utf8.count <= 1_024 && value.sourceBundleID.utf8.count <= 1_024,
+                    "Page source metadata exceeds bounds")
+    }
+
+    /// Full synthetic capture/store paths, not a string-only demonstration of grapheme amplification.
+    private static func metadataBounds(_ directory: URL) async throws {
+        for normal in ["Aé中😀Z", "e\u{301}", "👨‍👩‍👧‍👦"] {
+            for budget in 0...32 {
+                var expected = ""
+                for scalar in normal.unicodeScalars {
+                    guard expected.utf8.count + scalar.utf8.count <= budget else { break }
+                    expected.unicodeScalars.append(scalar)
+                }
+                let fromString = BoundedText.prefix(normal, maximumBytes: budget)
+                let fromData = BoundedText.decode(Data(normal.utf8), maximumBytes: budget)
+                try require(fromString == expected && fromData == expected,
+                            "Valid UTF-8 boundary created a replacement scalar or exceeded the byte budget")
+            }
+        }
+        let malformed = Data([0xF0, 0x28, 0x8C, 0x28, 0xFF, 0x61])
+        let repaired = String(decoding: malformed, as: UTF8.self)
+        for budget in 0...24 {
+            let decoded = BoundedText.decode(malformed, maximumBytes: budget)
+            try require(decoded == BoundedText.prefix(repaired, maximumBytes: budget) && decoded.utf8.count <= budget,
+                        "Invalid UTF-8 repair is not scalar-safe and output-bounded")
+        }
+        let text = "e" + String(repeating: "\u{301}", count: 60_000)
+        let raw = Data(text.utf8)
+        let count = 24
+        try require(raw.count * count <= StorageLimits.maximumCaptureBytes, "Synthetic aggregate exceeds raw capture budget")
+        let result = try ClipboardCapturePolicy.capture(itemTypes: Array(repeating: ["public.utf8-plain-text"], count: count),
+                                                        source: text, bundleID: String(repeating: "x", count: 1_025)) { _, _ in raw }
+        guard case .ready(let captured) = result else { throw CheckFailure("Bounded metadata suppressed valid raw content") }
+        try requireBoundedMetadata(captured)
+        try require(captured.sourceBundleID.isEmpty && captured.representations.count == count,
+                    "Oversized identity was truncated into a different ID, or raw items were lost")
+        try require(captured.representations.allSatisfy { $0.data == raw }, "Metadata limits changed original capture bytes")
+        let store = HistoryStore(directory: directory)
+        try await store.save(captured, retention: 0)
+        let first = try await page(store)
+        guard let clip = first.clips.first else { throw CheckFailure("Bounded capture was not saved") }
+        try requireBoundedClip(clip)
+        let restored = try await store.representations(clip.id)
+        try require(restored.count == count, "Multi-item raw recovery lost an item")
+        for (original, recovered) in zip(captured.representations, restored) {
+            try require(original.item == recovered.item && original.type == recovered.type && original.data == recovered.data,
+                        "Metadata normalization altered raw representation identity or data")
+        }
+        let db = try FixtureDatabase(directory)
+        let byteLengths = try db.rows("""
+            SELECT length(CAST(title AS BLOB)),length(CAST(excerpt AS BLOB)),length(CAST(search_text AS BLOB)),
+                   length(CAST(source AS BLOB)),length(CAST(source_bundle_id AS BLOB)) FROM entry WHERE id=?
+            """, [clip.id.uuidString])
+        let limits = [4_096, 8_192, 131_072, 1_024, 1_024]
+        try require(byteLengths.count == 1, "Missing persisted metadata")
+        for (value, maximum) in zip(byteLengths[0], limits) {
+            try require(Int(value).map { $0 <= maximum } == true, "Persisted metadata exceeds UTF-8 byte budget")
+        }
+
+        // A provider can supply a syntactically valid URL even when its basename cannot exist on disk.
+        let fileName = "a" + String(repeating: "\u{301}", count: 1_000_000) + ".png"
+        let fileData = Data(("file:///" + fileName).utf8)
+        let files = try ClipboardCapturePolicy.capture(itemTypes: [["public.file-url"]], source: "Synthetic", bundleID: "") { _, _ in fileData }
+        guard case .ready(let files) = files else { throw CheckFailure("Synthetic file URL was rejected") }
+        try requireBoundedMetadata(files)
+        try require(files.kind == .image && files.representations[0].data == fileData,
+                    "Truncated filename changed full-extension image classification or original URL")
+        try require(!files.searchText.contains("file:///"), "File metadata search includes its path")
+        try await store.save(files, retention: 0)
+
+        // Storage must defend itself even if a caller bypasses ClipboardCapturePolicy.
+        let untrusted = ClipCapture(kind: .text, title: text, excerpt: text, searchText: text, source: text,
+                                    sourceBundleID: String(repeating: "x", count: 1_025),
+                                    representations: [ClipRepresentation(item: 0, type: "public.utf8-plain-text", data: Data("storage-only".utf8))])
+        try await store.save(untrusted, retention: 0)
+        let direct = try await page(store).clips.first { $0.kind == .text && $0.id != clip.id }!
+        try await store.setPinned(direct.id, true)
+        try await store.saveGroup(nil, name: "Preserved")
+        let group = try await store.groupCatalog()[0].id
+        try await store.setGroup(direct.id, group: group, included: true)
+        try await store.save(untrusted, retention: 0)
+        let duplicate = try await page(store).clips.first { $0.id == direct.id }!
+        try requireBoundedClip(duplicate)
+        try require(duplicate.copies == 2 && duplicate.pinned && duplicate.groups == [group] && duplicate.sourceBundleID.isEmpty,
+                    "Metadata normalization changed duplicate/protected identity")
+
+        // Old oversized rows stay readable without constructing unbounded Swift list strings.
+        let update = try db.prepare("UPDATE entry SET title=?,excerpt=?,source=?,source_bundle_id=? WHERE id=?")
+        defer { sqlite3_finalize(update) }
+        try db.run(update, values: [text, text, text, String(repeating: "x", count: 1_025), direct.id.uuidString])
+        let legacy = try await page(store).clips.first { $0.id == direct.id }!
+        try requireBoundedClip(legacy)
+        try require(legacy.sourceBundleID.isEmpty, "Legacy oversized identity was silently truncated")
+        try await expectError(.nameConflict) { try await store.saveGroup(nil, name: text) }
+        try require(try await store.groupCatalog().count == 1, "Rejected oversized group was persisted")
+        _ = try await page(store, query: text)
+
+        // Normal text preserves the old Character-prefix semantics while it fits the byte budget.
+        for normal in ["first line\nsecond 中文", String(repeating: "中", count: 300),
+                       String(repeating: "👨‍👩‍👧‍👦", count: 150), String(repeating: "e\u{301}", count: 250)] {
+            let input = Data(normal.utf8)
+            let result = try ClipboardCapturePolicy.capture(itemTypes: [["public.utf8-plain-text"]], source: "Synthetic", bundleID: "local.synthetic") { _, _ in input }
+            guard case .ready(let value) = result else { throw CheckFailure("Normal Unicode capture failed") }
+            try requireBoundedMetadata(value)
+            try require(value.searchText == normal && value.excerpt == String(normal.prefix(240))
+                        && value.title == String(normal.split(whereSeparator: \.isNewline).first!.prefix(120)),
+                        "Normal Unicode character-prefix semantics changed")
+        }
+        let separatorInputs = [Data(String(repeating: "a", count: 32_767).utf8), Data("b".utf8)]
+        let separated = try ClipboardCapturePolicy.capture(itemTypes: Array(repeating: ["public.utf8-plain-text"], count: 2), source: "Synthetic", bundleID: "") { index, _ in separatorInputs[index] }
+        guard case .ready(let separated) = separated else { throw CheckFailure("Separator boundary capture failed") }
+        try requireBoundedMetadata(separated)
+        try require(separated.searchText.count <= 32_768, "Item separator was not charged to the shared character budget")
+
+        let rtf = Data(("{\\rtf1\\ansi\\uc1 a" + String(repeating: "\\u769?", count: 30_000) + "}").utf8)
+        try require(rtf.count < ClipboardFormats.maximumRichTextPreviewBytes, "Synthetic RTF exceeds parser budget")
+        let rich = try ClipboardCapturePolicy.capture(itemTypes: [["public.rtf"]], source: "Synthetic", bundleID: "") { _, _ in rtf }
+        guard case .ready(let rich) = rich else { throw CheckFailure("RTF-only capture failed") }
+        try await store.save(rich, retention: 0)
+        let richID = try db.rows("SELECT entry_id FROM representation WHERE uti='public.rtf'").first!.first!
+        let richClip = try await page(store).clips.first { $0.id.uuidString == richID }!
+        try requireBoundedClip(richClip)
+        let richOriginals = try await store.representations(richClip.id)
+        try require(richOriginals.count == 1 && richOriginals[0].data == rtf, "RTF metadata fallback changed raw bytes")
+        print("  metadata amplification fixtures: 24 legal text items, 2 MB file URL, storage bypass and legacy rows")
+    }
+
+    /// A prepared reader must not collect assets belonging to another connection's uncommitted write.
+    private static func recoveryIsolation(_ directory: URL) async throws {
+        let store = HistoryStore(directory: directory)
+        try await store.prepare()
+        let db = try FixtureDatabase(directory)
+        let assets = directory.appendingPathComponent("assets", isDirectory: true)
+        let kept = UUID().uuidString, entry = UUID().uuidString
+        let keptFile = assets.appendingPathComponent(kept)
+        let orphanFile = assets.appendingPathComponent(UUID().uuidString)
+        try Data([9]).write(to: orphanFile)
+        try db.execute("BEGIN IMMEDIATE")
+        var committed = false
+        defer { if !committed { try? db.execute("ROLLBACK") } }
+        try Data([1, 2, 3]).write(to: keptFile)
+        try db.execute("""
+            INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,copied_at,byte_size)
+            VALUES('\(entry)','\(entry)','text','Synthetic','Synthetic','Synthetic','Synthetic',1000,3);
+            INSERT INTO representation VALUES('\(kept)','\(entry)',0,'public.utf8-plain-text','\(kept)',3);
+            """)
+        try await expectError(.storage) { try await store.recoverAssets() }
+        try require(FileManager.default.fileExists(atPath: keptFile.path)
+                    && FileManager.default.fileExists(atPath: orphanFile.path),
+                    "Recovery changed assets before obtaining the writer lock")
+        try db.execute("COMMIT")
+        committed = true
+        try await store.recoverAssets()
+        try require(FileManager.default.fileExists(atPath: keptFile.path)
+                    && !FileManager.default.fileExists(atPath: orphanFile.path),
+                    "Recovery lost a committed asset or retained a true orphan")
+        let originals = try await store.representations(UUID(uuidString: entry)!)
+        try require(originals.count == 1 && originals[0].data == Data([1, 2, 3]), "Committed content cannot be restored")
+
+        let rolledBack = assets.appendingPathComponent(UUID().uuidString)
+        try db.execute("BEGIN IMMEDIATE")
+        committed = false
+        try Data([4]).write(to: rolledBack)
+        try await expectError(.storage) { try await store.recoverAssets() }
+        try require(FileManager.default.fileExists(atPath: rolledBack.path), "Recovery removed an in-flight rollback asset")
+        try db.execute("ROLLBACK")
+        committed = true
+        try await store.recoverAssets()
+        try require(!FileManager.default.fileExists(atPath: rolledBack.path)
+                    && FileManager.default.fileExists(atPath: keptFile.path), "Post-rollback orphan recovery is incorrect")
+        try require(try db.rows("PRAGMA integrity_check").first?.first == "ok", "Recovery damaged SQLite integrity")
+    }
+
     private static func milliseconds(since start: UInt64) -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
     }
@@ -1405,72 +1900,114 @@ private struct RegressionChecks {
         return try files.reduce(0) { $0 + ((try $1.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0) }
     }
 
-    /// Warm-query microbenchmark, not application latency or an Instruments memory measurement.
+    private static func requireSamePage(_ lhs: HistoryPage, _ rhs: HistoryPage) throws {
+        try require(lhs.total == rhs.total && lhs.storedEntries == rhs.storedEntries && lhs.storedBytes == rhs.storedBytes
+                    && lhs.clips.count == rhs.clips.count, "Page totals or projection size differ")
+        for (a, b) in zip(lhs.clips, rhs.clips) {
+            try require(a.id == b.id && a.kind == b.kind && a.title == b.title && a.excerpt == b.excerpt
+                        && a.source == b.source && a.sourceBundleID == b.sourceBundleID && a.copiedAt == b.copiedAt
+                        && a.byteSize == b.byteSize && a.pinned == b.pinned && a.copies == b.copies
+                        && a.groups == b.groups && a.hasFileReference == b.hasFileReference,
+                        "Production query modes returned different metadata, groups or order")
+        }
+    }
+
+    /// Both branches execute complete production pages; these are warm queries, not UI or RSS measurements.
     private static func benchmark(_ directory: URL, large: Bool) async throws {
-        print("BENCHMARK warm synthetic SQLite queries; not UI latency; no real history used")
+        print("BENCHMARK equal-work production pages; alternating warm samples; synthetic histories only")
         print("  OS=\(ProcessInfo.processInfo.operatingSystemVersionString), CPU=\(machineString("machdep.cpu.brand_string")), cores=\(ProcessInfo.processInfo.processorCount), RAM=\(ProcessInfo.processInfo.physicalMemory), SQLite=\(String(cString: sqlite3_libversion()))")
         for characters in large ? [2_048, 32_768] : [2_048] {
-            // One incrementally populated database per text size avoids holding three worst-case FTS databases at once.
             let dataDirectory = try child(directory, "chars-\(characters)")
-            let store = HistoryStore(directory: dataDirectory)
-            try await store.prepare()
-            let db = try FixtureDatabase(dataDirectory)
-            let insert = try db.prepare("""
-                INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,source_bundle_id,copied_at,byte_size)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
-                """)
-            defer { sqlite3_finalize(insert) }
+            let candidateDirectory = try child(dataDirectory, "candidate")
+            let fallbackDirectory = try child(dataDirectory, "fallback")
+            // Modes use distinct databases: optional-index initialization changes persistent triggers.
+            try await HistoryStore(directory: candidateDirectory).prepare()
+            try await HistoryStore(directory: fallbackDirectory, enablesTrigram: false).prepare()
+            let databases = try [FixtureDatabase(candidateDirectory), FixtureDatabase(fallbackDirectory)]
+            let group = UUID().uuidString
+            for db in databases {
+                try db.execute("INSERT INTO user_group VALUES('\(group)','Benchmark Group',0,0)")
+            }
+            let inserts = try databases.map { try $0.prepare("""
+                INSERT INTO entry(id,fingerprint,kind,title,excerpt,search_text,source,source_bundle_id,copied_at,byte_size,pinned)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """) }
+            defer { for statement in inserts { sqlite3_finalize(statement) } }
             let chunk = "synthetic ASCII 中文检索 punctuation_- ".padding(toLength: 64, withPad: "abcdef", startingAt: 0)
-            var inserted = 0
+            var inserted = 0, expectedBytes = 0
             for count in [1_000, 5_000, 10_000] {
                 let start = DispatchTime.now().uptimeNanoseconds
-                try db.execute("BEGIN IMMEDIATE")
+                for db in databases { try db.execute("BEGIN IMMEDIATE") }
                 do {
                     for index in inserted..<count {
                         let suffix = index.isMultiple(of: 97) ? " selective-needle-唯一匹配" : " ordinary-content"
                         let body = String(String(repeating: chunk, count: characters / chunk.count + 1).prefix(characters - suffix.count)) + suffix
                         let id = UUID().uuidString
-                        try db.run(insert, values: [id, id, "text", "Synthetic \(index)", "Synthetic fixture", body, "Synthetic", "",
-                                                    String(1_000 + index), String(body.utf8.count)])
+                        let values = [id, id, index.isMultiple(of: 11) ? "link" : "text", "Synthetic \(index)",
+                                      "Synthetic fixture", body, "Synthetic", "local.synthetic.validation",
+                                      String(1_000 + index / 3), String(body.utf8.count), index.isMultiple(of: 53) ? "1" : "0"]
+                        for (db, statement) in zip(databases, inserts) {
+                            try db.run(statement, values: values)
+                            if index.isMultiple(of: 7) { try db.execute("INSERT INTO entry_group VALUES('\(id)','\(group)')") }
+                        }
+                        expectedBytes += body.utf8.count
                     }
-                    try db.execute("COMMIT")
+                    for db in databases { try db.execute("COMMIT") }
                 } catch {
-                    try? db.execute("ROLLBACK")
+                    for db in databases { try? db.execute("ROLLBACK") }
                     throw error
                 }
                 inserted = count
-                try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                print(String(format: "  rows=%d chars=%d build=%.1fms disk=%d bytes", count, characters, milliseconds(since: start), try diskBytes(dataDirectory)))
-                let queries = ["selective-needle", "中文检索", "not-present-anywhere", "中", "AS", "_%"]
-                let countSQL = try db.prepare("SELECT COUNT(*) FROM entry e WHERE e.kind IN ('text','link','file') AND e.search_text LIKE ? ESCAPE '\\'")
-                let pageSQL = try db.prepare("SELECT e.id FROM entry e WHERE e.kind IN ('text','link','file') AND e.search_text LIKE ? ESCAPE '\\' ORDER BY e.pinned DESC,e.copied_at DESC,e.id LIMIT 60")
-                defer { sqlite3_finalize(countSQL); sqlite3_finalize(pageSQL) }
-                for query in queries {
-                    _ = try await page(store, query: query, limit: 60)
-                    var production: [Double] = [], like: [Double] = []
-                    for _ in 0..<15 {
-                        var started = DispatchTime.now().uptimeNanoseconds
-                        let actual = try await page(store, query: query, limit: 60)
-                        production.append(milliseconds(since: started))
-                        started = DispatchTime.now().uptimeNanoseconds
-                        try db.bind([likePattern(query)], to: countSQL)
-                        try require(sqlite3_step(countSQL) == SQLITE_ROW, "LIKE benchmark count failed")
-                        let expected = Int(sqlite3_column_int64(countSQL, 0))
-                        sqlite3_reset(countSQL)
-                        try db.bind([likePattern(query)], to: pageSQL)
-                        var ids: [String] = []
-                        while true {
-                            let status = sqlite3_step(pageSQL)
-                            if status == SQLITE_DONE { break }
-                            try require(status == SQLITE_ROW, "LIKE benchmark page failed")
-                            ids.append(String(cString: sqlite3_column_text(pageSQL, 0)))
-                        }
-                        sqlite3_reset(pageSQL)
-                        like.append(milliseconds(since: started))
-                        try require(actual.total == expected && actual.clips.map { $0.id.uuidString } == ids, "Benchmark query semantic mismatch")
+                for db in databases { try db.execute("PRAGMA wal_checkpoint(TRUNCATE)") }
+                print(String(format: "  rows=%d chars=%d build-both=%.1fms candidate-disk=%d LIKE-disk=%d bytes",
+                             count, characters, milliseconds(since: start), try diskBytes(candidateDirectory), try diskBytes(fallbackDirectory)))
+                // A fresh measurement store avoids stale capacity caches after out-of-store fixture inserts.
+                let candidate = HistoryStore(directory: candidateDirectory)
+                let fallback = HistoryStore(directory: fallbackDirectory, enablesTrigram: false)
+                try await candidate.prepare()
+                try await fallback.prepare()
+                let available = try !databases[0].rows("SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE '%fts5%' AND sql LIKE '%trigram%'").isEmpty
+                print("    candidate-mode=\(available ? "trigram" : "LIKE fallback (tokenizer unavailable)"); comparison-mode=forced LIKE")
+                var cases = ["selective-needle", "中文检索", "not-present-anywhere", "中", "AS", "_%"].map {
+                    (label: $0, query: $0, scope: "all", kind: Optional<ClipKind>.none, interval: Optional<DateInterval>.none, limit: 60)
+                }
+                cases += [
+                    ("high-hit/group", "中文检索", group, nil, nil, 60),
+                    ("high-hit/pinned", "中文检索", "pinned", nil, nil, 60),
+                    ("high-hit/type+time/300", "中文检索", "all", .text,
+                     DateInterval(start: Date(timeIntervalSince1970: 1_000 + Double(count / 6)),
+                                  end: Date(timeIntervalSince1970: 1_001 + Double(count / 3))), 300)
+                ]
+                for item in cases {
+                    func measuredPage(_ store: HistoryStore) async throws -> HistoryPage {
+                        try await page(store, query: item.query, scope: item.scope, kind: item.kind,
+                                       interval: item.interval, limit: item.limit)
                     }
-                    print(String(format: "    query=%@ page p50=%.2f p95=%.2fms LIKE-only(count+ids) p50=%.2f p95=%.2fms samples=15",
-                                 String(reflecting: query), percentile(production, 0.5), percentile(production, 0.95), percentile(like, 0.5), percentile(like, 0.95)))
+                    let warm = try await measuredPage(candidate)
+                    try requireSamePage(warm, await measuredPage(fallback))
+                    try require(warm.storedEntries == count && warm.storedBytes == expectedBytes,
+                                "Benchmark capacity projection is stale after fixture growth")
+                    if item.scope == "all", item.kind == nil, item.interval == nil {
+                        let expected = try databases[0].integer("SELECT COUNT(*) FROM entry WHERE kind IN ('text','link','file') AND search_text LIKE ? ESCAPE '\\'", [likePattern(item.query)])
+                        let ids = try referenceIDs(databases[0], query: item.query)
+                        try require(warm.total == expected && warm.clips.map { $0.id.uuidString } == Array(ids.prefix(item.limit)),
+                                    "Benchmark production page differs from independent LIKE oracle")
+                    }
+                    var production: [Double] = [], like: [Double] = []
+                    for sample in 0..<15 {
+                        var actual: HistoryPage?, forced: HistoryPage?
+                        for useCandidate in sample.isMultiple(of: 2) ? [true, false] : [false, true] {
+                            let started = DispatchTime.now().uptimeNanoseconds
+                            let result = try await measuredPage(useCandidate ? candidate : fallback)
+                            let elapsed = milliseconds(since: started)
+                            if useCandidate { production.append(elapsed); actual = result }
+                            else { like.append(elapsed); forced = result }
+                        }
+                        guard let actual, let forced else { throw CheckFailure("Incomplete benchmark sample") }
+                        try requireSamePage(actual, forced)
+                    }
+                    print(String(format: "    case=%@ candidate-page p50=%.2f p95=%.2fms forced-LIKE-page p50=%.2f p95=%.2fms samples=15",
+                                 item.label, percentile(production, 0.5), percentile(production, 0.95), percentile(like, 0.5), percentile(like, 0.95)))
                 }
             }
         }

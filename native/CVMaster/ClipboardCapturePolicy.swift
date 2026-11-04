@@ -176,42 +176,43 @@ enum ClipboardCapturePolicy {
             if $0.item != $1.item { return $0.item < $1.item }
             return (typeRanks[$0.type] ?? Int.max) < (typeRanks[$1.type] ?? Int.max)
         }
-        var text = ""
-        var files: [String] = []
+        var searchable = BoundedText.Builder()
+        let hasFiles = representations.contains { $0.type == fileType }
+        var fileCount = 0
+        var firstFileName = ""
+        var allFilesAreImages = true
         var hasImage = false
         var hasURL = false
         for index in itemTypes.indices {
-            var itemText = ""
+            var plainData: Data?
+            var urlData: Data?
             for representation in representations where representation.item == index {
                 let type = representation.type, data = representation.data
                 if ClipboardFormats.rasterImages.contains(type) { hasImage = true }
-                if type == stringType {
-                    itemText = String(decoding: data.prefix(StorageLimits.searchableCharacters * 4), as: UTF8.self)
-                }
-                if type == urlType {
-                    hasURL = true
-                    if itemText.isEmpty { itemText = String(decoding: data.prefix(StorageLimits.searchableCharacters * 4), as: UTF8.self) }
-                }
+                if type == stringType { plainData = data }
+                if type == urlType { hasURL = true; urlData = data }
                 if type == fileType, let value = String(data: data, encoding: .utf8), let url = URL(string: value) {
-                    files.append(url.lastPathComponent)
+                    let name = url.lastPathComponent
+                    fileCount += 1
+                    // 分类只看完整扩展名，显示 / 搜索预算不能将图片后缀截丢或伪造后缀。
+                    allFilesAreImages = allFilesAreImages && ClipboardFormats.areImageFiles([name])
+                    if fileCount == 1 { firstFileName = MetadataBounds.title(name) }
+                    searchable.append(name)
                 }
             }
-            if !itemText.isEmpty, text.count < StorageLimits.searchableCharacters {
-                if !text.isEmpty { text += "\n" }
-                text += itemText.prefix(StorageLimits.searchableCharacters - text.count)
-            }
+            if !hasFiles, let data = plainData ?? urlData { searchable.appendUTF8(data) }
         }
-        if !hasURL, let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+        let text = searchable.value
+        if !hasFiles, !hasURL, let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
            ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil {
             hasURL = true
         }
-        let kind: ClipKind = !files.isEmpty ? (ClipboardFormats.areImageFiles(files) ? .image : .file) : hasImage ? .image : hasURL ? .link : .text
-        let searchable = String((!files.isEmpty ? files.joined(separator: "\n") : text).prefix(StorageLimits.searchableCharacters))
+        let kind: ClipKind = hasFiles ? (allFilesAreImages ? .image : .file) : hasImage ? .image : hasURL ? .link : .text
         let title: String
-        if !files.isEmpty { title = files.count == 1 ? files[0] : "\(files[0]) 等 \(files.count) 个文件" }
+        if hasFiles { title = fileCount == 1 ? firstFileName : "\(firstFileName) 等 \(fileCount) 个文件" }
         else if hasImage { title = "图片" }
-        else { title = String(text.split(whereSeparator: \.isNewline).first ?? "富文本内容") }
-        return .ready(ClipCapture(kind: kind, title: String(title.prefix(120)), excerpt: String(searchable.prefix(240)), searchText: searchable,
-                                  source: source, sourceBundleID: bundleID, representations: representations))
+        else { title = String(text.split(maxSplits: 1, whereSeparator: \.isNewline).first ?? "富文本内容") }
+        return .ready(MetadataBounds.normalize(ClipCapture(kind: kind, title: title, excerpt: text, searchText: text,
+                                  source: source, sourceBundleID: bundleID, representations: representations)))
     }
 }

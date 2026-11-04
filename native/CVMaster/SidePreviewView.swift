@@ -11,11 +11,20 @@ struct SidePreviewView: View {
     @ObservedObject var library: ClipboardLibrary
     /// 当前锚定条目的轻量元数据，不持有完整内容。
     let clip: Clip
+    /// 只保留当前预览的一张图像，退出预览时释放局部引用。
+    @ViewState<NSImage?> private var thumbnail = nil
+
+    /// 同一条目的缩略图可能稍后才返回，必须同时比较实际结果，不能只按条目重启任务。
+    private struct ThumbnailKey: Equatable {
+        let clipID: UUID
+        let data: Data?
+    }
 
     /// 从最新投影读取置顶状态，避免操作后侧边按钮仍显示旧状态。
     private var pinned: Bool { library.clips.first { $0.id == clip.id }?.pinned ?? clip.pinned }
 
     var body: some View {
+        let thumbnailKey = ThumbnailKey(clipID: clip.id, data: library.preview?.thumbnail)
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 if clip.showsImage {
@@ -43,8 +52,8 @@ struct SidePreviewView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     if library.previewLoading { ProgressView().controlSize(.small) }
-                    if let data = library.preview?.thumbnail, let image = NSImage(data: data) {
-                        Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 240)
+                    if let thumbnail {
+                        Image(nsImage: thumbnail).resizable().scaledToFit().frame(maxHeight: 240)
                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                             .accessibilityLabel("图片预览")
                     }
@@ -70,5 +79,13 @@ struct SidePreviewView: View {
         .padding(16).frame(width: 310, height: 300)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("内容预览")
+        .task(id: thumbnailKey) {
+            thumbnail = nil
+            // 与卡片一致，取消的任务不交付图像；让出执行机会，不把 AppKit 绘制移出主线程。
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            thumbnail = thumbnailKey.data.flatMap { NSImage(data: $0) }
+        }
+        .onDisappear { thumbnail = nil }
     }
 }

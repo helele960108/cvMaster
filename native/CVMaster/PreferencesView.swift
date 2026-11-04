@@ -50,7 +50,7 @@ struct PreferencesView: View {
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
                                 .disabled(library.globalShortcut == .defaultShortcut)
-                                .help("恢复为 ⌥Space")
+                                .help("恢复为 \(GlobalShortcut.defaultShortcut.display)")
                         }
                         if let conflict = library.shortcutConflict {
                             Label(conflict, systemImage: "exclamationmark.triangle.fill")
@@ -58,7 +58,7 @@ struct PreferencesView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                                 .accessibilityLabel("快捷键设置失败：\(conflict)")
                         }
-                        Text("快捷键必须包含 ⌥ 或 ⌃；仅 ⌘ 会与复制、粘贴等菜单快捷键冲突，⌘⇧ 组合可用。Esc 取消。")
+                        Text("快捷键需包含 ⌥、⌃ 或 ⌘⇧；仅 ⌘ 会与复制、粘贴等菜单快捷键冲突。Esc 取消。")
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }

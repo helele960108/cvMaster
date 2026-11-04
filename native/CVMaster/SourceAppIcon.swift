@@ -5,6 +5,7 @@
  */
 import AppKit
 import SwiftUI
+import OSLog
 
 /// 通过 Bundle ID 解析本机应用，身份缺失时使用系统通用符号。
 struct SourceAppIcon: View {
@@ -32,6 +33,7 @@ struct SourceAppIcon: View {
             guard !Task.isCancelled, !bundleID.isEmpty else { return }
             image = ApplicationDirectory.shared.icon(for: bundleID)
         }
+        .onDisappear { image = nil }
     }
 }
 
@@ -52,6 +54,8 @@ final class ApplicationDirectory {
     static let shared = ApplicationDirectory()
     /// 最多保存 64 个应用身份；图标与名称一起缓存，避免每行重复访问文件系统。
     private let cache = NSCache<NSString, CachedEntry>()
+    /// 冷 miss 区间仅使用固定名称，不附带来源标识、路径或用户内容。
+    private let signposter = OSSignposter(subsystem: "local.helele.cvmaster", category: "application-directory")
     /// 未安装时仍能显示可读名称的内置默认项，不根据同名应用猜测其他身份。
     private let fallbackNames = [
         "com.1password.1password": "1Password",
@@ -102,6 +106,8 @@ final class ApplicationDirectory {
     private func entry(for bundleID: String) -> CachedEntry {
         let key = bundleID as NSString
         if let cached = cache.object(forKey: key) { return cached }
+        let interval = signposter.beginInterval("ApplicationResolve", id: signposter.makeSignpostID())
+        defer { signposter.endInterval("ApplicationResolve", interval) }
         let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
         let name: String
         let icon: NSImage?
@@ -124,6 +130,8 @@ final class ApplicationDirectory {
 
     /// 显式栅格化到 Retina 40 px，列表缩到 12 pt、设置行缩到 20 pt 时仍保持清晰。
     private func rasterizedIcon(for url: URL) -> NSImage? {
+        let interval = signposter.beginInterval("ApplicationIconRasterize", id: signposter.makeSignpostID())
+        defer { signposter.endInterval("ApplicationIconRasterize", interval) }
         let original = NSWorkspace.shared.icon(forFile: url.path)
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 40,
                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,

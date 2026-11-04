@@ -21,6 +21,8 @@ final class ClipboardLibrary: ObservableObject {
     /// 只保留当前最多 300 条元数据；关闭浮层后回收为首屏大小。
     @Published private(set) var clips: [Clip] = []
     @Published private(set) var groups: [ClipGroup] = []
+    /// 分组写入及权威目录回读期间阻止重复操作，不影响历史列表浏览。
+    @Published private(set) var changingGroups = false
     @Published private(set) var total = 0
     /// 全库条数与内容表示字节，仅供容量展示，不受当前搜索或筛选影响。
     @Published private(set) var storedEntries = 0
@@ -254,7 +256,7 @@ final class ClipboardLibrary: ObservableObject {
         shortcutConflict = nil
     }
 
-    /// 恢复默认 ⌥Space；同样经过冲突检查。
+    /// 恢复默认 ⇧⌘V；同样经过冲突检查。
     func resetGlobalShortcut() {
         updateGlobalShortcut(.defaultShortcut)
     }
@@ -286,9 +288,7 @@ final class ClipboardLibrary: ObservableObject {
         searchTask?.cancel()
         searchTask = nil
         loading = false
-        previewVersion += 1
-        previewTask?.cancel()
-        preview = nil
+        loadPreview(nil)
         if clips.count > StorageLimits.pageSize { clips = Array(clips.prefix(StorageLimits.pageSize)) }
         limit = StorageLimits.pageSize
     }
@@ -437,16 +437,20 @@ final class ClipboardLibrary: ObservableObject {
         previewVersion += 1
         let version = previewVersion
         previewTask?.cancel()
+        previewTask = nil
+        previewLoading = false
         preview = nil
-        guard let id else { previewLoading = false; return }
+        guard let id else { return }
         previewLoading = true
         previewTask = Task { [weak self, store] in
             do {
                 let result = try await store.preview(id)
                 guard let self, !Task.isCancelled, version == self.previewVersion else { return }
+                self.previewTask = nil
                 self.preview = result; self.previewLoading = false
             } catch {
                 guard let self, !Task.isCancelled, version == self.previewVersion else { return }
+                self.previewTask = nil
                 self.previewLoading = false; self.report(error)
             }
         }
@@ -463,22 +467,73 @@ final class ClipboardLibrary: ObservableObject {
     }
 
     func setGroup(_ clip: Clip, group: UUID, included: Bool) {
+        guard !changingGroups else { return }
         mutate { try await $0.setGroup(clip.id, group: group, included: included) }
     }
 
-    /// 保存成功后立即刷新独立目录，不让高频采集或搜索取消分组更新。
     func saveGroup(_ id: UUID?, name: String) {
+        changeGroups { try await $0.saveGroup(id, name: name) }
+    }
+
+    func deleteGroup(_ id: UUID) {
+        changeGroups(deleting: id) { try await $0.deleteGroup(id) }
+    }
+
+    func moveGroup(_ id: UUID, offset: Int) {
+        changeGroups { try await $0.moveGroup(id, offset: offset) }
+    }
+
+    /// 写入不随浮层关闭而取消；只回读分组目录，删除时才刷新历史归属。
+    private func changeGroups(deleting id: UUID? = nil,
+                              _ action: @escaping @Sendable (HistoryStore) async throws -> Void) {
+        guard !changingGroups else { return }
+        changingGroups = true
+        groupsVersion += 1
+        groupsTask?.cancel()
+        groupsTask = nil
         Task { [weak self, store] in
+            defer { self?.changingGroups = false }
+            var committed = false
             do {
-                try await store.saveGroup(id, name: name)
-                self?.refreshGroups()
-                self?.scheduleSearch()
+                try await action(store)
+                committed = true
             } catch { self?.report(error) }
+            guard let self else { return }
+            var scopeChanged = false
+            do {
+                let groups = try await store.groupCatalog()
+                scopeChanged = self.applyGroupCatalog(groups)
+            } catch {
+                self.report(error)
+                // 删除已提交但目录读取失败时，不能继续展示确定已删除的筛选。
+                if committed, let id {
+                    self.groups.removeAll { $0.id == id }
+                    if self.scope == id.uuidString {
+                        self.scope = "all"
+                        scopeChanged = true
+                    }
+                }
+            }
+            if committed, id != nil, !scopeChanged {
+                self.scheduleSearch(resetLimit: false)
+            }
         }
+    }
+
+    /// 只对成功读取的目录修复失效 scope；启动时的空数组不能作为删除依据。
+    @discardableResult
+    private func applyGroupCatalog(_ groups: [ClipGroup]) -> Bool {
+        self.groups = groups
+        if let id = UUID(uuidString: scope), !groups.contains(where: { $0.id == id }) {
+            scope = "all"
+            return true
+        }
+        return false
     }
 
     /// 分组规模上限 100，独立目录读取成本小，使用版本号防止旧结果覆盖。
     func refreshGroups() {
+        guard !changingGroups else { return }
         groupsVersion += 1
         let version = groupsVersion
         groupsTask?.cancel()
@@ -486,7 +541,7 @@ final class ClipboardLibrary: ObservableObject {
             do {
                 let groups = try await store.groupCatalog()
                 guard let self, !Task.isCancelled, self.groupsVersion == version else { return }
-                self.groups = groups
+                self.applyGroupCatalog(groups)
             } catch {
                 guard !Task.isCancelled else { return }
                 self?.report(error)

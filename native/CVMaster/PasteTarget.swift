@@ -1,5 +1,7 @@
 /**
  * 原粘贴位置的辅助功能快照与串行校验；不读取文本、选区内容或剪贴板。
+ * 当前生产粘贴路径使用“当前激活应用”语义，不引用本文件的 AX 捕获 / 焦点恢复实现；
+ * 保留供未来恢复原输入节点时参考，修改前先阅读 docs/性能与实现约束.md。
  * @author helele
  * @since 2026-10-20
  */
@@ -343,6 +345,10 @@ final class PasteTargetWorker: @unchecked Sendable {
         }
         if let input {
             try requirePID(input, equals: processIdentifier, deadline: deadline)
+            // 部分应用在输入框失焦后把窗口本身报告为 focused UI element；窗口的窗口就是自己。
+            if CFEqual(input, window) {
+                return Focus(window: window, input: input)
+            }
             guard let inputWindow = try element(input, attribute: kAXWindowAttribute, deadline: deadline) else {
                 throw Failure.unavailable
             }

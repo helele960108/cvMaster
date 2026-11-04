@@ -5,13 +5,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+AX=0
+ARGS=()
 for argument in "$@"; do
   case "$argument" in
-    --benchmark|--benchmark-large) ;;
+    --ax) AX=1 ;;
+    --benchmark|--benchmark-large) ARGS+=("$argument") ;;
     --help|-h)
-      printf 'Usage: %s [--benchmark] [--benchmark-large]\n' "$0"
+      printf 'Usage: %s [--ax] [--benchmark] [--benchmark-large]\n' "$0"
       printf 'Runs isolated synthetic regressions; optional benchmarks use 1k/5k/10k rows.\n'
       printf '%s\n' '--benchmark-large additionally measures 32,768-character search text (higher disk/time use).'
+      printf '%s\n' '--ax additionally runs the real AX focus-restoration regression; requires Accessibility permission.'
       exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$argument" >&2; exit 2 ;;
   esac
@@ -39,11 +43,21 @@ printf 'Isolated Swift 6 optimized validation (%s, SDK %s)\n' "$ARCH" "$(xcrun -
 xcrun swiftc -O -swift-version 6 -target "$ARCH-apple-macosx26.5" -sdk "$SDK" \
   -module-cache-path "$WORK/module-cache" -parse-as-library \
   "$ROOT/CVMaster/Models.swift" \
+  "$ROOT/CVMaster/GlobalShortcut.swift" \
+  "$ROOT/CVMaster/SingleInstanceLock.swift" \
   "$ROOT/CVMaster/HistoryStore.swift" \
   "$ROOT/CVMaster/ThumbnailPipeline.swift" \
   "$ROOT/CVMaster/ClipboardCapturePolicy.swift" \
   "$ROOT/CVMaster/PasteHandoffPolicy.swift" \
   "$ROOT/CVMaster/PasteFocusRestoration.swift" \
+  "$ROOT/Validation/SingleInstanceChecks.swift" \
   "$ROOT/Validation/RegressionChecks.swift" \
   -lsqlite3 -o "$WORK/regression-checks"
-"$WORK/regression-checks" --workspace "$WORK/data" "$@"
+if [ "${#ARGS[@]}" -gt 0 ]; then
+  "$WORK/regression-checks" --workspace "$WORK/data" "${ARGS[@]}"
+else
+  "$WORK/regression-checks" --workspace "$WORK/data"
+fi
+if [ "$AX" -eq 1 ]; then
+  "$ROOT/scripts/check-ax.sh"
+fi

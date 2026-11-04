@@ -12,9 +12,9 @@ struct GlobalShortcut: Equatable, Sendable {
     let modifiers: UInt32
     let label: String
 
-    static let defaultShortcut = GlobalShortcut(keyCode: UInt32(kVK_Space),
-                                                modifiers: UInt32(optionKey),
-                                                label: "Space")
+    static let defaultShortcut = GlobalShortcut(keyCode: UInt32(kVK_ANSI_V),
+                                                modifiers: UInt32(cmdKey) | UInt32(shiftKey),
+                                                label: "V")
 
     /// 偏好使用明确类型字段，不把快捷键配置序列化成 JSON。
     private enum Keys {
@@ -23,7 +23,7 @@ struct GlobalShortcut: Equatable, Sendable {
         static let label = "hotKeyLabel"
     }
 
-    /// 读取已保存组合；没有配置时使用默认 ⌥Space。
+    /// 读取已保存组合；没有配置时使用默认 ⇧⌘V。
     static func load(from defaults: UserDefaults = .standard) -> GlobalShortcut {
         guard defaults.object(forKey: Keys.code) != nil else { return .defaultShortcut }
         let code = UInt32(clamping: defaults.integer(forKey: Keys.code))
