@@ -149,6 +149,7 @@ private struct RegressionChecks {
                 ("thumbnail deduplication, deadline, cancellation and worker cap", thumbnails),
                 ("two-phase clipboard cursor, bounded retries and delayed data", captureCursor),
                 ("pure privacy gate and per-item capture budgets", capturePolicy),
+                ("session lock resolver fails closed and blocks capture", sessionLock),
                 ("default shortcut, saved preferences and reset round trips", globalShortcut),
                 ("pure paste handoff request binding and focus transitions", pasteHandoff),
                 ("pure paste focus restoration single-use permits and cancellation", pasteFocusRestoration)
@@ -1157,16 +1158,19 @@ private struct RegressionChecks {
 
     private static func capturePolicy(_ directory: URL) async throws {
         try require(!ClipboardCapturePolicy.isBlocked(sleeping: false, sessionInactive: false, onConsole: true,
-                                                      loginComplete: true, secureInput: false), "Active known session was blocked")
-        for state in [(true, false, Optional(true), Optional(true), false),
-                      (false, true, Optional(true), Optional(true), false),
-                      (false, false, Optional(false), Optional(true), false),
-                      (false, false, Optional(true), Optional(false), false),
-                      (false, false, nil, Optional(true), false),
-                      (false, false, Optional(true), nil, false),
-                      (false, false, Optional(true), Optional(true), true)] {
+                                                      loginComplete: true, secureInput: false, screenLocked: false),
+                    "Active known session was blocked")
+        for state in [(true, false, Optional(true), Optional(true), false, false),
+                      (false, true, Optional(true), Optional(true), false, false),
+                      (false, false, Optional(false), Optional(true), false, false),
+                      (false, false, Optional(true), Optional(false), false, false),
+                      (false, false, nil, Optional(true), false, false),
+                      (false, false, Optional(true), nil, false, false),
+                      (false, false, Optional(true), Optional(true), true, false),
+                      (false, false, Optional(true), Optional(true), false, true)] {
             try require(ClipboardCapturePolicy.isBlocked(sleeping: state.0, sessionInactive: state.1, onConsole: state.2,
-                                                         loginComplete: state.3, secureInput: state.4), "Unknown/blocked session was not fail-closed")
+                                                         loginComplete: state.3, secureInput: state.4, screenLocked: state.5),
+                        "Unknown/blocked session was not fail-closed")
         }
         var reads = 0
         for type in ClipboardCapturePolicy.sensitiveTypes {
@@ -1252,6 +1256,34 @@ private struct RegressionChecks {
         guard case .ready(let fallback) = fallback else { throw CheckFailure("Missing image representation had no fallback") }
         try require(fallback.representations.count == 1 && fallback.representations[0].type == "public.jpeg",
                     "Missing first image provider did not fall back to next supported representation")
+    }
+
+    /// Lock-state parsing is pure; the notification-backed monitor is deliberately not started here.
+    private static func sessionLock(_: URL) async throws {
+        let key = SessionLockResolver.screenIsLockedKey
+        try require(SessionLockResolver.resolve(nil) == .unknown, "Missing session dictionary must stay unknown")
+        try require(SessionLockResolver.resolve([:]) == .unlocked, "Absent screen-lock key must mean unlocked")
+        try require(SessionLockResolver.resolve([key: NSNumber(value: true)]) == .locked,
+                    "True screen-lock value was not locked")
+        try require(SessionLockResolver.resolve([key: NSNumber(value: false)]) == .unlocked,
+                    "False screen-lock value was not unlocked")
+        try require(SessionLockResolver.resolve([key: "true"]) == .unknown,
+                    "Malformed screen-lock value must fail closed")
+        try require(ClipboardCapturePolicy.isBlocked(sleeping: false, sessionInactive: false, onConsole: true,
+                                                     loginComplete: true, secureInput: false, screenLocked: true),
+                    "Screen lock did not block capture")
+        try require(!ClipboardCapturePolicy.isBlocked(sleeping: false, sessionInactive: false, onConsole: true,
+                                                      loginComplete: true, secureInput: false, screenLocked: false),
+                    "Unlocked active session was blocked")
+        let now = ContinuousClock.Instant.now
+        try require(!ClipboardCapturePolicy.shouldRebaseAfterPollGap(lastPoll: nil, now: now, maximumGap: .seconds(5)),
+                    "Initial poll must not be treated as a gap")
+        try require(!ClipboardCapturePolicy.shouldRebaseAfterPollGap(lastPoll: now.advanced(by: .seconds(-5)),
+                                                                     now: now, maximumGap: .seconds(5)),
+                    "Gap at the threshold must not rebase")
+        try require(ClipboardCapturePolicy.shouldRebaseAfterPollGap(lastPoll: now.advanced(by: .seconds(-6)),
+                                                                    now: now, maximumGap: .seconds(5)),
+                    "Long poll gap must conservatively rebase")
     }
 
     /// Pure event sequences reproduce await-time focus races without AppKit, AX, or a running app.

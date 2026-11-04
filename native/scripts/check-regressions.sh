@@ -48,6 +48,7 @@ xcrun swiftc -O -swift-version 6 -target "$ARCH-apple-macosx26.5" -sdk "$SDK" \
   "$ROOT/CVMaster/HistoryStore.swift" \
   "$ROOT/CVMaster/ThumbnailPipeline.swift" \
   "$ROOT/CVMaster/ClipboardCapturePolicy.swift" \
+  "$ROOT/CVMaster/SessionLockState.swift" \
   "$ROOT/CVMaster/PasteHandoffPolicy.swift" \
   "$ROOT/CVMaster/PasteFocusRestoration.swift" \
   "$ROOT/Validation/SingleInstanceChecks.swift" \

@@ -19,6 +19,10 @@ final class ClipboardMonitor {
     private var pendingSource: (attempt: ClipboardChangeCursor.Attempt, name: String, bundleID: String)?
     private var sleeping = false
     private var sessionInactive = false
+    private let lockMonitor = SessionLockMonitor()
+    /// 轮询被 App Nap / 系统休眠长时间暂停时，无法确认期间是否锁屏；恢复首轮保守跳过该窗口。
+    private static let maximumPollGap: Duration = .seconds(5)
+    private var lastPollAt: ContinuousClock.Instant?
     private var readingSnapshot = false
     /// 延迟数据提供者可能重入主循环；生命周期 / 基线变化使正在读取的快照失效。
     private var baselineVersion: UInt64 = 0
@@ -32,6 +36,12 @@ final class ClipboardMonitor {
         guard timer == nil else { return }
         sleeping = false
         sessionInactive = false
+        lockMonitor.onTransition = { [weak self] locked in
+            guard let self else { return }
+            if locked { self.library?.invalidatePendingCapture() }
+            self.resetBaseline()
+        }
+        lockMonitor.start()
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.sleeping = true; self?.resetBaseline() }
@@ -46,6 +56,7 @@ final class ClipboardMonitor {
             MainActor.assumeIsolated { self?.sessionInactive = false; self?.resetBaseline() }
         })
         resetBaseline()
+        lastPollAt = nil
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
@@ -58,10 +69,12 @@ final class ClipboardMonitor {
         timer?.invalidate(); timer = nil
         for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         observers.removeAll()
+        lockMonitor.stop()
         sleeping = false
         sessionInactive = false
         cursor = ClipboardChangeCursor()
         pendingSource = nil
+        lastPollAt = nil
         baselineVersion &+= 1
     }
 
@@ -74,17 +87,27 @@ final class ClipboardMonitor {
 
     private func captureBlocked() -> Bool {
         let session = CGSessionCopyCurrentDictionary() as? [String: Any]
-        // 公开会话键可识别启动时已不在控制台的会话；缺失状态按不安全处理。
-        // 会话切换通知并非锁屏通知，on-console / 安全输入也不保证覆盖所有锁屏状态。
+        // 公开会话键识别非控制台 / 未登录会话；锁屏使用未公开键并叠加锁屏通知。
         return ClipboardCapturePolicy.isBlocked(
             sleeping: sleeping, sessionInactive: sessionInactive,
             onConsole: session?[kCGSessionOnConsoleKey as String] as? Bool,
             loginComplete: session?[kCGSessionLoginDoneKey as String] as? Bool,
-            secureInput: IsSecureEventInputEnabled())
+            secureInput: IsSecureEventInputEnabled(),
+            screenLocked: lockMonitor.isLocked)
     }
+
+    /// 供 ClipboardLibrary 在真正保存前复核，避免锁屏后的在途快照落库。
+    func isCaptureBlocked() -> Bool { captureBlocked() }
 
     private func poll() {
         guard timer != nil, !readingSnapshot, let library else { return }
+        lockMonitor.refresh()
+        let now = ContinuousClock.Instant.now
+        if ClipboardCapturePolicy.shouldRebaseAfterPollGap(lastPoll: lastPollAt, now: now,
+                                                           maximumGap: Self.maximumPollGap) {
+            resetBaseline()
+        }
+        lastPollAt = now
         let pasteboard = NSPasteboard.general
         let change = pasteboard.changeCount
         let attempt: ClipboardChangeCursor.Attempt
@@ -123,6 +146,12 @@ final class ClipboardMonitor {
             try validateSnapshot(pasteboard, change: change, version: version, bundleID: source.bundleID)
             switch result {
             case .ready(let capture):
+                // 读取与提交之间可能锁屏；接受前再次刷新并 fail-closed，不把在途内容落库。
+                lockMonitor.refresh()
+                guard !captureBlocked() else {
+                    finish(attempt, resolution: .commit)
+                    return
+                }
                 if finish(attempt, resolution: .commit) == .committed { library.accept(capture) }
             case .retryable:
                 if finish(attempt, resolution: .retryable) == .exhausted { reportUnavailableData() }
