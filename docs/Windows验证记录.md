@@ -5,6 +5,8 @@
 > 版本：0.1.0.0
 >
 > 环境：Windows 11 build 26300，x64，125% DPI，.NET SDK 10.0.402
+>
+> **说明：本文是历史验证记录，不代表当前提交。** 后续代码已继续修改，当前快照必须在 Windows 上重新构建、运行测试并完成交互验收后，才能引用为“已通过”。
 
 ## 1. 构建与部署
 
@@ -151,3 +153,56 @@
 - `windows/build.ps1 -SkipPublish`：Release 构建 0 警告、0 错误。
 - `CvMaster.SmokeTests`：**39/39 通过**，新增“存储层不探测外部引用文件”“超预算 RTF 纯文本转换明确拒绝”。
 - 本轮未启动 UI，未操作真实剪贴板、真实粘贴目标、锁屏或睡眠，因此粘贴交接、会话门禁和缩略图超时仍需真实桌面环境交互验收。
+
+## 14. 分组删除与手动排序同步（2026-11-04）
+
+### 实现范围
+
+- 同步 macOS 刚完成的分组删除、前移 / 后移与相应交互保障，不扩展图片布局、批量整理或搜索引擎。Windows 默认全局快捷键仍为 `Alt+Space`。
+- 用户分组右键与更多 → 当前分组共用重命名、前移、后移及删除入口；“全部 / 置顶”固定，首尾移动禁用。顺序保存到现有 `position` 字段，不修改 schema 或模型，不引入拖拽。
+- 删除采用固定 GUID 和分组名称的原生确认，默认取消、Esc 可取消；只删除分组及归属，不删除历史、表示资产或原文件，不执行保留清理或资产回收。记录未来仍按既有保留策略处理。
+- `SaveGroupAsync`、`DeleteGroupAsync`、`MoveGroupAsync` 共用显式 `BEGIN IMMEDIATE` 事务。移动在事务内读取最新目录、按 GUID 相邻交换并连续编号；缺失删除幂等，缺失重命名 / 移动报 `MissingGroup`，非法方向报 `Storage`。新建保留 `MAX(position)+1`，名称上限对齐 20 文本元素 / 1024 UTF-8 字节，保留 Windows 名称比较规则。
+- 分组写入至目录回读共享忙碌状态，目录版本与取消令牌防止旧读覆盖；写入不随浮层关闭取消。排序不重查历史或重置筛选、选择与加载数量；删除后刷新条目归属，仅完成时仍选中被删组才回“全部”。已提交删除遇目录回读失败也不复活，读取失败不将未知目录视为空。
+- 菜单与对话框使用独立计数协调自动隐藏，确认期间不因菜单关闭而隐藏父浮层。条目删除及消息弹窗复用同一对话框保护，使用 `try/finally` 收尾。
+
+### 本轮实际验证及阻塞
+
+- 当前主机为 macOS arm64；`dotnet`、`csc`、`msbuild`、`mono` 和 `pwsh` 不可用，常见 .NET 安装路径也没有 SDK。遵循本轮范围未擅自安装系统工具。
+- 已执行 `git diff --check` 与已有暂存差异格式检查，未发现格式错误；使用 Python 标准 XML 解析器验证修改的 XAML、两个相关 csproj 及共享 `Directory.Build.props` 的 XML 语法。
+- **未执行 C# 编译、WPF 交叉构建、分组隔离回归、完整冒烟、发布或部署**，也未启动 Windows GUI。XML 语法和源码复核不能代替编译或运行验证；此前 39/39 为旧代码的历史结果，不计入本轮通过项。
+- 新增合成分组 suite 接入默认冒烟及 `--groups-only`，覆盖删除保历史 / 资产、顺序和新建追加、边界与非法方向、跨连接最新 GUID 定位、重新打开、命名限额、清理保组，以及 `RAISE(FAIL)` 故障注入回滚与 SQLite 完整性。测试已编写，运行结果待具备 SDK 的环境确认。
+- `--groups-only` 不调用依赖 Win32 的原始表示恢复，用直接资产字节快照验证保留；未修改或弱化生产文件安全检查。测试仅使用自建临时目录，先释放存储和连接再清理；完整冒烟仍需 Windows。
+
+### 后续执行入口
+
+在 Windows 安装符合 `windows/global.json` 的 SDK 后，从 `windows` 目录执行：
+
+```powershell
+.\build.ps1 -SkipPublish
+# 可单独重跑分组用例
+dotnet run --project src/CvMaster.SmokeTests/CvMaster.SmokeTests.csproj -- --groups-only
+```
+
+实机确认分组右键与更多入口一致、首尾与忙碌禁用、删除取消 / Esc / 确认、当前和非当前分组删除、关键词 / 类型 / 时间及条目选择 / 已加载数量保持、自动隐藏保护、关闭重开与重启顺序持久化。只有上述检查实际完成后，才能更新本节为通过结论。
+
+本轮未操作真实历史或剪贴板，未更改当前 macOS 安装版，未运行部署脚本，未 commit、未 push；保留原有工作区改动。
+
+## 15. 开源前隐私采集修复与交叉编译验证（2026-11-04）
+
+- **延迟读取来源绑定**：pending 请求现在同时保存来源与剪贴板序列号；读取前要求当前序列与请求一致。被排除应用、自身写入、锁屏 / 安全桌面、关闭记录或来源不可用的事件会立即作废旧 pending，避免“上一个普通应用的来源 + 最新剪贴板内容”的组合入库。
+- **保存前复核**：读取前后重新检查记录状态、安全输入 / 安全桌面、排除列表和敏感过滤；状态变化时丢弃已读取快照。
+- **迟到回调**：`ClipCapture` 携带采集开始时的隐私代数；暂停、关闭记录、切换敏感过滤、修改排除列表或清空历史会递增代数，UI 保存前再次校验，拒绝排队后迟到的采集。
+- **验证方式**：在 macOS 上将 .NET SDK 10.0.402 临时安装到 `/tmp`（不修改系统、仓库或用户数据），执行 `dotnet build cvMaster.slnx -c Release -p:EnableWindowsTargeting=true`，结果 0 警告、0 错误；执行 `CvMaster.SmokeTests --groups-only`，`ALL PASS (95 checks)`。
+- **未验证**：本机不是 Windows，无法运行 `ClipboardMonitor`、WPF UI、真实剪贴板、锁屏 / UAC、目标窗口粘贴或安装包；上述修复仍须在 Windows 实机完成采集竞态和交互验收。交叉编译只证明代码可编译，不证明运行时行为。
+
+本轮未启动 Windows GUI、未读取真实剪贴板或历史库、未修改用户数据；新增临时 SDK 位于 `/tmp`，不属于仓库内容。
+
+## 16. 代码质量整理（2026-11-04）
+
+- 新增根目录 `.editorconfig`，统一基础字符集、换行、缩进和行尾空白；C# / Swift / XAML 为 4 空格，JSON / YAML 为 2 空格，PowerShell 保持 CRLF。
+- `windows/Directory.Build.props` 启用 `EnforceCodeStyleInBuild=true`，让基础代码风格检查进入构建。
+- 修复 `dotnet format` 报告的 C# 空格格式问题；`dotnet format cvMaster.slnx --verify-no-changes` 通过。
+- 分组名称比较抽出 `CvMaster.Core.GroupNames.Equal`，UI 预检与存储层共用忽略大小写 / 宽度的同一规则，避免两套判断不一致。
+- 日志时间戳改用 `CultureInfo.InvariantCulture`；快捷键解析改用泛型 `Enum.Parse<Key>`；拆分过长的 P/Invoke 常量声明。
+- 验证：`dotnet build cvMaster.slnx -c Release -p:EnableWindowsTargeting=true` 0 警告、0 错误；`--groups-only` 95/95 通过。
+- 保留 `PasteTargetWorker` / `PasteFocusRestorationRequest` 作为未来原输入焦点恢复的参考实现，但当前生产粘贴路径不引用；文档已明确标注。是否删除或正式接入，应在产品语义确定后单独处理，避免在本次整理中引入行为变化。

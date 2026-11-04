@@ -1,0 +1,16 @@
+# 统一文本换行，避免 macOS / Windows 贡献者产生纯换行差异。
+* text=auto eol=lf
+
+# Windows 脚本与批处理保持 CRLF，兼容系统自带编辑器。
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 图标与发布包按二进制处理，禁止换行转换。
+*.png binary
+*.ico binary
+*.icns binary
+*.zip binary
+*.7z binary
+*.dmg binary
+*.pkg binary

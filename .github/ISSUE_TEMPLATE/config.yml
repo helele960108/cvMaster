@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 私下报告安全问题
+    url: https://github.com/helele960108/cvMaster/security/advisories/new
+    about: 不要在公开 Issue 中披露漏洞细节、真实剪贴板内容或未脱敏日志。
+  - name: 隐私与数据说明
+    url: https://github.com/helele960108/cvMaster/blob/main/docs/%E9%9A%90%E7%A7%81%E4%B8%8E%E6%95%B0%E6%8D%AE%E8%AF%B4%E6%98%8E.md
+    about: 了解采集范围、保存位置、保留策略和已知限制。

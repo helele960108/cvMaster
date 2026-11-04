@@ -1,0 +1,83 @@
+name: Bug 报告
+description: 报告可复现的功能、构建或兼容性问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请确认这不是安全问题；安全问题请按 [SECURITY.md](https://github.com/helele960108/cvMaster/blob/main/SECURITY.md) 私下报告。
+        请勿粘贴真实剪贴板内容、历史数据库、日志原文、账号、证书或本机绝对路径。
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - macOS
+        - Windows
+        - 两个平台都受影响
+        - 文档 / 构建脚本
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本或提交
+      description: 版本号、Git 提交 SHA，或说明从哪个分支构建
+      placeholder: "例如 0.1.0 / fc45822"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 环境
+      description: 操作系统版本、CPU 架构、编译器 / SDK 版本；不要填写用户名或本机路径
+      placeholder: "例如 macOS 26.5 arm64 / Swift 6.4；或 Windows 11 23H2 x64 / .NET 10.0.402"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 使用合成内容描述最小步骤；如需示例，请用“示例文本”代替真实剪贴板内容
+      placeholder: |
+        1. 开启记录
+        2. 从应用 A 复制“示例文本”
+        3. 打开浮层并……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏的日志或截图（可选）
+      description: 只保留错误码、阶段和非内容状态；删除路径、PID、账号、文件名和正文
+      render: text
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私检查
+      options:
+        - label: 我已移除真实剪贴板内容、数据库、日志原文、证书、密钥和个人路径
+          required: true
+        - label: 这不是一个需要私下报告的安全漏洞
+          required: true

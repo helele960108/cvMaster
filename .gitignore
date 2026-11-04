@@ -1,5 +1,6 @@
 # 本地原生构建产物与系统文件，不纳入版本控制。
 .DS_Store
+Thumbs.db
 native/.build/
 
 # Windows 构建与发布产物
@@ -8,5 +9,44 @@ windows/**/obj/
 windows/dist/
 windows/.artifacts/
 windows/.vs/
+windows/packaging/Output/
 *.user
 *.suo
+
+# 本地编辑器与代理工作资料
+.idea/
+*.iml
+.vscode/
+.zcode/
+
+# 本地运行数据、诊断与崩溃材料
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+*.crash
+*.dmp
+*.dSYM/
+
+# 签名、证书与本地环境配置
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+*.mobileprovision
+*.provisionprofile
+
+# 临时与发布压缩包
+*.app/
+*.dmg
+*.pkg
+*.zip
+*.7z
+*.tar.gz
