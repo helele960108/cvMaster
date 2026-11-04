@@ -22,6 +22,7 @@ public sealed class ClipboardMonitor : IDisposable
     private readonly Func<bool> _skipSensitive;
     private readonly Func<IReadOnlyCollection<string>> _excludedProcesses;
     private readonly Func<ForegroundInfo?> _foreground;
+    private readonly Func<long> _privacyEpoch;
     private readonly Action<ClipCapture> _accept;
     private readonly Action<LibraryErrorCode> _report;
     private readonly HwndSource _source;
@@ -46,7 +47,7 @@ public sealed class ClipboardMonitor : IDisposable
     private int _selfWrite;
     private int _pendingRead;
     private ForegroundInfo? _pendingSource;
-    private bool _pendingSkipSensitive;
+    private uint _pendingSequence;
     private bool _started;
     private bool _disposed;
 
@@ -55,6 +56,7 @@ public sealed class ClipboardMonitor : IDisposable
         Func<bool> skipSensitive,
         Func<IReadOnlyCollection<string>> excludedProcesses,
         Func<ForegroundInfo?> foreground,
+        Func<long> privacyEpoch,
         Action<ClipCapture> accept,
         Action<LibraryErrorCode> report)
     {
@@ -62,6 +64,7 @@ public sealed class ClipboardMonitor : IDisposable
         _skipSensitive = skipSensitive;
         _excludedProcesses = excludedProcesses;
         _foreground = foreground;
+        _privacyEpoch = privacyEpoch;
         _accept = accept;
         _report = report;
 
@@ -128,6 +131,7 @@ public sealed class ClipboardMonitor : IDisposable
             _suppressSequence = sequence;
             _baselineSequence = sequence;
             _baselineVersion++;
+            ClearPendingLocked();
         }
     }
 
@@ -147,6 +151,25 @@ public sealed class ClipboardMonitor : IDisposable
             _baselineSequence = NativeMethods.GetClipboardSequenceNumber();
             _suppressSequence = 0;
             _baselineVersion++;
+            ClearPendingLocked();
+        }
+    }
+
+    /// <summary>调用方必须持有 _sequenceGate；丢弃尚未读取的请求，避免旧来源读取新内容。</summary>
+    private void ClearPendingLocked()
+    {
+        _pendingSource = null;
+        _pendingSequence = 0;
+        Interlocked.Exchange(ref _pendingRead, 0);
+    }
+
+    /// <summary>事件被隐私规则拒绝时同步作废旧请求；在途读取会因版本变化而丢弃。</summary>
+    private void DiscardPendingCapture()
+    {
+        lock (_sequenceGate)
+        {
+            _baselineVersion++;
+            ClearPendingLocked();
         }
     }
 
@@ -171,12 +194,14 @@ public sealed class ClipboardMonitor : IDisposable
 
         if (Volatile.Read(ref _selfWrite) == 1)
         {
+            DiscardPendingCapture();
             return;
         }
 
         // 安全桌面（锁屏 / UAC）或输入桌面不可用时保守跳过，不读取剪贴板内容。
         if (IsCaptureBlocked())
         {
+            DiscardPendingCapture();
             return;
         }
 
@@ -184,38 +209,43 @@ public sealed class ClipboardMonitor : IDisposable
         {
             if (!_shouldRecord())
             {
+                DiscardPendingCapture();
                 return;
             }
         }
         catch (Exception exception)
         {
             AppLog.Error("clipboard-record-state", exception);
+            DiscardPendingCapture();
             return;
         }
 
         var source = _foreground();
         if (source is null || source.ProcessId == Environment.ProcessId)
         {
+            DiscardPendingCapture();
             return;
         }
 
-        var excluded = _excludedProcesses();
-        if (excluded.Any(item =>
-                ProcessCatalog.Normalize(item).Equals(source.ProcessName, StringComparison.OrdinalIgnoreCase)))
+        if (IsSourceExcluded(source))
         {
+            DiscardPendingCapture();
             return;
         }
 
-        var skipSensitive = _skipSensitive();
         lock (_sequenceGate)
         {
             _pendingSource = source;
-            _pendingSkipSensitive = skipSensitive;
+            _pendingSequence = sequence;
         }
 
         Interlocked.Exchange(ref _pendingRead, 1);
         StartReadWorker();
     }
+
+    private bool IsSourceExcluded(ForegroundInfo source) =>
+        _excludedProcesses().Any(item =>
+            ProcessCatalog.Normalize(item).Equals(source.ProcessName, StringComparison.OrdinalIgnoreCase));
 
     private void StartReadWorker()
     {
@@ -258,18 +288,19 @@ public sealed class ClipboardMonitor : IDisposable
                 Thread.Sleep(attempt == 0 ? 60 : 40);
                 if (!_shouldRecord() || IsCaptureBlocked())
                 {
+                    DiscardPendingCapture();
                     break;
                 }
 
                 ForegroundInfo? source;
-                bool skipSensitive;
+                uint expectedSequence;
                 lock (_sequenceGate)
                 {
                     source = _pendingSource;
-                    skipSensitive = _pendingSkipSensitive;
+                    expectedSequence = _pendingSequence;
                 }
 
-                if (source is null)
+                if (source is null || expectedSequence == 0)
                 {
                     break;
                 }
@@ -281,7 +312,31 @@ public sealed class ClipboardMonitor : IDisposable
                 }
 
                 var sequence = NativeMethods.GetClipboardSequenceNumber();
+                if (sequence != expectedSequence)
+                {
+                    // 事件已被后续写入替换；保留 pending，让下一轮使用新来源与序列。
+                    Interlocked.Exchange(ref _pendingRead, 1);
+                    continue;
+                }
+
+                bool skipSensitive;
+                try
+                {
+                    skipSensitive = _skipSensitive();
+                }
+                catch (Exception exception)
+                {
+                    AppLog.Error("clipboard-record-state", exception);
+                    DiscardPendingCapture();
+                    break;
+                }
+
+                var privacyEpoch = _privacyEpoch();
                 var capture = ReadClipboard(source, skipSensitive);
+                if (capture is not null)
+                {
+                    capture.PrivacyEpoch = privacyEpoch;
+                }
                 if (capture is null)
                 {
                     if (Volatile.Read(ref _pendingRead) == 0)
@@ -310,6 +365,26 @@ public sealed class ClipboardMonitor : IDisposable
 
                 if (!_shouldRecord() || IsCaptureBlocked())
                 {
+                    DiscardPendingCapture();
+                    break;
+                }
+
+                bool skipSensitiveNow;
+                try
+                {
+                    skipSensitiveNow = _skipSensitive();
+                }
+                catch (Exception exception)
+                {
+                    AppLog.Error("clipboard-record-state", exception);
+                    DiscardPendingCapture();
+                    break;
+                }
+
+                // 读取期间新增排除或切换敏感过滤时，不能把已读取内容交给旧策略入库。
+                if (skipSensitiveNow != skipSensitive || IsSourceExcluded(source))
+                {
+                    DiscardPendingCapture();
                     break;
                 }
 

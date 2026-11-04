@@ -163,13 +163,13 @@ public sealed record HotKeyGesture(ModifierKeys Modifiers, Key Key)
             var character = char.ToUpperInvariant(trimmed[0]);
             if (character is >= 'A' and <= 'Z')
             {
-                key = (Key)Enum.Parse(typeof(Key), character.ToString());
+                key = Enum.Parse<Key>(character.ToString());
                 return true;
             }
 
             if (character is >= '0' and <= '9')
             {
-                key = (Key)Enum.Parse(typeof(Key), "D" + character);
+                key = Enum.Parse<Key>("D" + character);
                 return true;
             }
 

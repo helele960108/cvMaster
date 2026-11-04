@@ -136,6 +136,9 @@ public sealed class ClipCapture
     public required string Source { get; init; }
     public required string SourceProcess { get; init; }
     public required IReadOnlyList<ClipRepresentation> Representations { get; init; }
+
+    /// <summary>采集开始时的隐私状态代数；保存前与当前代数不一致则丢弃。</summary>
+    public long PrivacyEpoch { get; set; }
 }
 
 /// <summary>全库容量统计，不受搜索或筛选影响。</summary>

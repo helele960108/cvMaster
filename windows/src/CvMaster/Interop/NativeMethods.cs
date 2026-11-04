@@ -57,7 +57,8 @@ internal static class NativeMethods
     public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
     public const int DWMWCP_ROUND = 2;
 
-    public const uint SHGFI_ICON = 0x00000100;    public const uint SHGFI_SMALLICON = 0x00000001;
+    public const uint SHGFI_ICON = 0x00000100;
+    public const uint SHGFI_SMALLICON = 0x00000001;
     public const uint SHGFI_USEFILEATTRIBUTES = 0x00000010;
     public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
     public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;

@@ -26,9 +26,13 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
     private readonly DispatcherTimer _feedbackTimer;
     private CancellationTokenSource? _searchCancellation;
     private int _searchVersion;
+    private CancellationTokenSource? _groupsCancellation;
+    private int _groupsVersion;
+    private bool _changingGroups;
     private int _limit = StorageLimits.PageSize;
     private bool _panelVisible;
     private int _captureBusy;
+    private long _privacyEpoch;
     private bool _clearing;
     private bool _initialized;
     private ICollectionView? _rowsView;
@@ -293,6 +297,24 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
+    public bool ChangingGroups
+    {
+        get => _changingGroups;
+        private set
+        {
+            if (_changingGroups == value)
+            {
+                return;
+            }
+
+            _changingGroups = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(CanChangeGroups));
+        }
+    }
+
+    public bool CanChangeGroups => !ChangingGroups && !_disposed;
+
     public ObservableCollection<ExcludedAppRow> ExcludedApplications
     {
         get => _excludedApplications;
@@ -306,6 +328,9 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
 
     public string ExcludedCountText => $"{ExcludedApplications.Count} 个应用";
 
+    /// <summary>隐私状态代数：记录开关、暂停、排除项和清空变化时递增，用于拒绝迟到的采集回调。</summary>
+    public long PrivacyEpoch => Interlocked.Read(ref _privacyEpoch);
+
     public bool RecordingEnabled
     {
         get => _settings.RecordingEnabled;
@@ -317,6 +342,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
             }
 
             _settings.RecordingEnabled = value;
+            Interlocked.Increment(ref _privacyEpoch);
             Monitor?.ResetBaseline();
             OnPropertyChanged();
             OnPropertyChanged(nameof(RecordingBannerVisible));
@@ -338,6 +364,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
 
             _paused = value;
             _settings.Paused = value;
+            Interlocked.Increment(ref _privacyEpoch);
             Monitor?.ResetBaseline();
             OnPropertyChanged();
             OnPropertyChanged(nameof(PausedVisible));
@@ -373,6 +400,8 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
             }
 
             _settings.SkipSensitive = value;
+            Interlocked.Increment(ref _privacyEpoch);
+            Monitor?.ResetBaseline();
             OnPropertyChanged();
         }
     }
@@ -665,34 +694,176 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
 
     public async Task RefreshGroupsAsync()
     {
+        if (_disposed || ChangingGroups)
+        {
+            return;
+        }
+
+        InvalidateGroupReads();
+        var version = _groupsVersion;
+        using var cancellation = new CancellationTokenSource();
+        _groupsCancellation = cancellation;
+        var token = cancellation.Token;
         try
         {
-            var groups = await _store.GetGroupsAsync();
-            Groups = new ObservableCollection<ClipGroup>(groups);
-            GroupsChanged?.Invoke(this, EventArgs.Empty);
+            var groups = await _store.GetGroupsAsync(token);
+            if (!_disposed && !token.IsCancellationRequested && version == _groupsVersion)
+            {
+                ApplyGroupCatalog(groups);
+            }
         }
-        catch (LibraryException exception)
+        catch (OperationCanceledException)
         {
-            ReportError(exception);
+        }
+        catch (Exception exception)
+        {
+            if (!_disposed && !token.IsCancellationRequested && version == _groupsVersion)
+            {
+                ReportGroupError(exception);
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_groupsCancellation, cancellation))
+            {
+                _groupsCancellation = null;
+            }
         }
     }
 
-    /// <summary>保存分组；返回面向用户的错误，成功时刷新目录与列表。</summary>
+    private void InvalidateGroupReads()
+    {
+        _groupsVersion++;
+        _groupsCancellation?.Cancel();
+        _groupsCancellation = null;
+    }
+
+    /// <summary>只有成功读取的目录才用于修复失效筛选；初始空目录不是删除依据。</summary>
+    private bool ApplyGroupCatalog(IReadOnlyList<ClipGroup> groups)
+    {
+        Groups = new ObservableCollection<ClipGroup>(groups);
+        GroupsChanged?.Invoke(this, EventArgs.Empty);
+        if (Guid.TryParse(Scope, out var id) && !groups.Any(group => group.Id == id))
+        {
+            Scope = "all";
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>保存分组只刷新目录，不重置历史浏览状态；失败返回面向用户的错误。</summary>
     public async Task<string?> SaveGroupAsync(Guid? id, string name)
     {
-        try
+        var error = await ChangeGroupsAsync(() => _store.SaveGroupAsync(id, name));
+        if (error is null && !_disposed)
         {
-            await _store.SaveGroupAsync(id, name);
-            await RefreshGroupsAsync();
-            ScheduleSearch(debounce: false);
             SetFeedback(id is null ? "已创建分组" : "已重命名分组");
-            return null;
         }
-        catch (LibraryException exception)
+
+        return error;
+    }
+
+    public async Task DeleteGroupAsync(Guid id)
+    {
+        var error = await ChangeGroupsAsync(() => _store.DeleteGroupAsync(id), id);
+        if (!_disposed)
         {
-            return exception.Message;
+            SetFeedback(error ?? "已删除分组，历史记录保留");
         }
     }
+
+    public async Task MoveGroupAsync(Guid id, int offset)
+    {
+        var error = await ChangeGroupsAsync(() => _store.MoveGroupAsync(id, offset));
+        if (!_disposed)
+        {
+            SetFeedback(error ?? "已调整分组顺序");
+        }
+    }
+
+    /// <summary>分组写入不随浮层关闭取消；忙碌状态覆盖写入与权威目录回读。</summary>
+    private async Task<string?> ChangeGroupsAsync(Func<Task> action, Guid? deleting = null)
+    {
+        if (!CanChangeGroups)
+        {
+            return "分组正在更新，请稍后重试。";
+        }
+
+        ChangingGroups = true;
+        InvalidateGroupReads();
+        var committed = false;
+        string? error = null;
+        try
+        {
+            try
+            {
+                await action();
+                committed = true;
+            }
+            catch (Exception exception)
+            {
+                error = GroupErrorMessage(exception);
+            }
+
+            if (_disposed)
+            {
+                return error;
+            }
+
+            var scopeChanged = false;
+            try
+            {
+                var groups = await _store.GetGroupsAsync();
+                if (_disposed)
+                {
+                    return error;
+                }
+
+                scopeChanged = ApplyGroupCatalog(groups);
+            }
+            catch (Exception exception)
+            {
+                error ??= GroupErrorMessage(exception);
+                // 已提交的删除不因回读失败复活；其他未知目录不作空目录处理。
+                if (committed && deleting is { } id && !_disposed)
+                {
+                    Groups = new ObservableCollection<ClipGroup>(Groups.Where(group => group.Id != id));
+                    GroupsChanged?.Invoke(this, EventArgs.Empty);
+                    if (Guid.TryParse(Scope, out var scopeId) && scopeId == id)
+                    {
+                        Scope = "all";
+                        scopeChanged = true;
+                    }
+                }
+            }
+
+            if (!_disposed && committed && deleting is not null && !scopeChanged)
+            {
+                ScheduleSearch(debounce: false, resetLimit: false);
+            }
+
+            return error;
+        }
+        finally
+        {
+            ChangingGroups = false;
+        }
+    }
+
+    private static string GroupErrorMessage(Exception exception)
+    {
+        if (exception is LibraryException libraryException)
+        {
+            AppLog.Error($"group-{libraryException.Code}");
+            return libraryException.Message;
+        }
+
+        AppLog.Error("group-operation", exception);
+        return LibraryException.UserMessage(LibraryErrorCode.Storage);
+    }
+
+    private void ReportGroupError(Exception exception) => SetFeedback(GroupErrorMessage(exception));
 
     public async Task TogglePinnedAsync(Clip clip)
     {
@@ -709,6 +880,11 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
 
     public async Task ToggleGroupAsync(Clip clip, Guid groupId)
     {
+        if (!CanChangeGroups)
+        {
+            return;
+        }
+
         try
         {
             var included = !clip.Groups.Contains(groupId);
@@ -738,6 +914,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
 
     public async Task ClearAsync(DateTimeOffset? before)
     {
+        Interlocked.Increment(ref _privacyEpoch);
         _clearing = true;
         try
         {
@@ -779,11 +956,14 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
     public async Task<ClipPreviewData> GetPreviewAsync(Guid id, CancellationToken cancellationToken) =>
         await _store.GetPreviewAsync(id, cancellationToken);
 
-    public async Task AcceptCaptureAsync(ClipCapture capture)
+    private bool CanAcceptCapture(long privacyEpoch) =>
+        privacyEpoch == PrivacyEpoch && _settings.RecordingEnabled && !_paused && !_clearing && !_disposed;
+
+    public async Task AcceptCaptureAsync(ClipCapture capture, long privacyEpoch)
     {
-        if (_clearing)
+        if (!CanAcceptCapture(privacyEpoch))
         {
-            AppLog.Info("capture-skipped-clearing");
+            AppLog.Info("capture-skipped-state");
             return;
         }
 
@@ -795,6 +975,13 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
 
         try
         {
+            // 排队或等待存储期间状态可能已变化；保存前再次校验，避免清空/暂停后迟到入库。
+            if (!CanAcceptCapture(privacyEpoch))
+            {
+                AppLog.Info("capture-skipped-state");
+                return;
+            }
+
             await _store.SaveAsync(capture, RetentionDays);
             if (_panelVisible)
             {
@@ -857,6 +1044,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
         var error = _settings.AddExcludedProcess(value);
         if (error is null)
         {
+            Interlocked.Increment(ref _privacyEpoch);
             RefreshExcludedApplications();
         }
 
@@ -866,6 +1054,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
     public void RemoveExcludedProcess(string processName)
     {
         _settings.RemoveExcludedProcess(processName);
+        Interlocked.Increment(ref _privacyEpoch);
         RefreshExcludedApplications();
     }
 
@@ -906,6 +1095,7 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
         }
 
         _disposed = true;
+        InvalidateGroupReads();
         _relativeTimeTimer.Stop();
         _feedbackTimer.Stop();
         _searchCancellation?.Cancel();

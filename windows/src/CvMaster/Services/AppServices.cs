@@ -29,7 +29,13 @@ public sealed class AppServices : IAsyncDisposable
             () => Settings.SkipSensitive,
             () => Settings.ExcludedProcessList,
             () => Foreground.CaptureCurrentOrLast(),
-            capture => Dispatch(() => _ = Library.AcceptCaptureAsync(capture)),
+            () => Library.PrivacyEpoch,
+            capture =>
+            {
+                // 使用采集开始时的代数；排队到 UI 后若暂停、关闭记录或清空，旧回调会被拒绝。
+                var privacyEpoch = capture.PrivacyEpoch;
+                Dispatch(() => _ = Library.AcceptCaptureAsync(capture, privacyEpoch));
+            },
             code => Dispatch(() => Library.ReportCaptureError(code)));
         Library.Monitor = Monitor;
         Paste = new PasteService(Store, Monitor, Settings);

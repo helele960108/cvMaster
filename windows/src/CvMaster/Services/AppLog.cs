@@ -3,6 +3,7 @@
  * @author helele
  * @since 2026-10-19
  */
+using System.Globalization;
 using System.IO;
 using System.Text;
 
@@ -41,7 +42,7 @@ public static class AppLog
                 }
 
                 var line = new StringBuilder()
-                    .Append(DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss.fff zzz"))
+                    .Append(DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture))
                     .Append(" [")
                     .Append(level)
                     .Append("] ")

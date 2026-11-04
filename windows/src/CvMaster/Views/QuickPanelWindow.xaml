@@ -199,6 +199,7 @@
                   Height="30"
                   Style="{StaticResource IconButtonStyle}"
                   ToolTip="新建分组"
+                  IsEnabled="{Binding CanChangeGroups}"
                   Click="AddGroupButton_Click">
             <controls:Icon Width="14" Height="14" Data="{StaticResource Icon.Plus}" />
           </Button>

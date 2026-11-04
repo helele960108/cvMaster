@@ -7,6 +7,6 @@
     <Deterministic>true</Deterministic>
     <DebugType>embedded</DebugType>
     <AnalysisLevel>latest</AnalysisLevel>
-    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
   </PropertyGroup>
 </Project>

@@ -4,7 +4,9 @@
  * @author helele
  * @since 2026-10-19
  */
+using System.Text;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
@@ -30,7 +32,7 @@ public partial class QuickPanelWindow : Window
     private DispatcherTimer? _autoHideTimer;
     private PasteTarget? _pasteTarget;
     private int _openMenus;
-    private bool _suppressAutoHide;
+    private int _openDialogs;
     private bool _pasting;
     private bool _resizeDragging;
     private bool _resizeGripAtTop;
@@ -68,6 +70,9 @@ public partial class QuickPanelWindow : Window
                     break;
                 case nameof(LibraryViewModel.KindFilter):
                     UpdateTypeChips();
+                    break;
+                case nameof(LibraryViewModel.ChangingGroups):
+                    RebuildGroupChips();
                     break;
             }
         };
@@ -110,7 +115,7 @@ public partial class QuickPanelWindow : Window
 
     public void HidePanel()
     {
-        if (!IsVisible)
+        if (!IsVisible || _openDialogs > 0)
         {
             return;
         }
@@ -334,7 +339,7 @@ public partial class QuickPanelWindow : Window
         _autoHideTimer.Tick += (_, _) =>
         {
             _autoHideTimer?.Stop();
-            if (!IsVisible || IsActive || _pasting || _suppressAutoHide || _openMenus > 0)
+            if (!IsVisible || IsActive || _pasting || _openDialogs > 0 || _openMenus > 0)
             {
                 return;
             }
@@ -372,6 +377,12 @@ public partial class QuickPanelWindow : Window
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
+        // 菜单和模态确认各自处理 Esc，不能穿透到根窗口关闭命令。
+        if (_openDialogs > 0 || _openMenus > 0)
+        {
+            return;
+        }
+
         if (e.Key == Key.Escape)
         {
             if (_preview is { IsVisible: true })
@@ -384,11 +395,6 @@ public partial class QuickPanelWindow : Window
             }
 
             e.Handled = true;
-            return;
-        }
-
-        if (_suppressAutoHide || _openMenus > 0)
-        {
             return;
         }
 
@@ -533,7 +539,23 @@ public partial class QuickPanelWindow : Window
             Content = content
         };
         Chip.SetIsActive(button, _vm.Scope == scope);
+        AutomationProperties.SetName(button, label);
         button.Click += (_, _) => _vm.Scope = scope;
+        if (Guid.TryParse(scope, out var groupId))
+        {
+            var menu = new ContextMenu { PlacementTarget = button };
+            TrackMenu(menu);
+            menu.Opened += (_, _) =>
+            {
+                ClosePreviewImmediate();
+                PopulateGroupActions(menu.Items, groupId);
+            };
+            button.ContextMenu = menu;
+            var index = _vm.Groups.ToList().FindIndex(group => group.Id == groupId);
+            AutomationProperties.SetHelpText(button,
+                $"用户分组第 {index + 1} 个，共 {_vm.Groups.Count} 个；右键管理，也可使用更多菜单中的当前分组。");
+        }
+
         GroupChipsPanel.Children.Add(button);
     }
 
@@ -588,15 +610,16 @@ public partial class QuickPanelWindow : Window
         pause.Click += (_, _) => _vm.Paused = !_vm.Paused;
         menu.Items.Add(pause);
 
-        var newGroup = new MenuItem { Header = "新建分组…" };
+        var newGroup = new MenuItem { Header = "新建分组…", IsEnabled = _vm.CanChangeGroups };
         newGroup.Click += (_, _) => _ = OpenGroupDialogAsync(null);
         menu.Items.Add(newGroup);
 
         if (Guid.TryParse(_vm.Scope, out var scopeId) && _vm.Groups.Any(group => group.Id == scopeId))
         {
-            var rename = new MenuItem { Header = "重命名当前分组…" };
-            rename.Click += (_, _) => _ = OpenGroupDialogAsync(scopeId);
-            menu.Items.Add(rename);
+            var currentGroup = new MenuItem { Header = "当前分组" };
+            PopulateGroupActions(currentGroup.Items, scopeId);
+            currentGroup.SubmenuOpened += (_, _) => PopulateGroupActions(currentGroup.Items, scopeId);
+            menu.Items.Add(currentGroup);
         }
 
         menu.Items.Add(new Separator());
@@ -614,15 +637,89 @@ public partial class QuickPanelWindow : Window
         menu.IsOpen = true;
     }
 
+    /// <summary>右键和更多菜单共用分组操作；固定范围从不传入此路径。</summary>
+    private void PopulateGroupActions(ItemCollection items, Guid groupId)
+    {
+        items.Clear();
+        var groups = _vm.Groups.ToList();
+        var index = groups.FindIndex(group => group.Id == groupId);
+        var available = _vm.CanChangeGroups && index >= 0;
+        var rename = new MenuItem { Header = "重命名…", IsEnabled = available };
+        rename.Click += (_, _) => _ = OpenGroupDialogAsync(groupId);
+        items.Add(rename);
+        var forward = new MenuItem { Header = "前移", IsEnabled = available && index > 0 };
+        forward.Click += (_, _) => _ = MoveGroupAsync(groupId, -1);
+        items.Add(forward);
+        var backward = new MenuItem { Header = "后移", IsEnabled = available && index < groups.Count - 1 };
+        backward.Click += (_, _) => _ = MoveGroupAsync(groupId, 1);
+        items.Add(backward);
+        items.Add(new Separator());
+        var delete = new MenuItem { Header = "删除分组…", IsEnabled = available };
+        delete.Click += (_, _) => _ = ConfirmDeleteGroupAsync(groupId);
+        items.Add(delete);
+    }
+
+    private async Task MoveGroupAsync(Guid groupId, int offset)
+    {
+        if (!_vm.CanChangeGroups || !_vm.Groups.Any(group => group.Id == groupId))
+        {
+            return;
+        }
+
+        ClosePreviewImmediate();
+        await _vm.MoveGroupAsync(groupId, offset);
+    }
+
+    private async Task ConfirmDeleteGroupAsync(Guid groupId)
+    {
+        var group = _vm.Groups.FirstOrDefault(group => group.Id == groupId);
+        if (!_vm.CanChangeGroups || group is null || _openDialogs > 0)
+        {
+            return;
+        }
+
+        _openDialogs++;
+        ClosePreviewImmediate();
+        try
+        {
+            var result = MessageBox.Show(
+                this,
+                "仅删除此分组及其分组关系，不会删除历史记录或原文件。记录仍可在“全部”和其他所属分组中查看。",
+                $"删除分组“{group.Name}”？",
+                MessageBoxButton.YesNoCancel,
+                MessageBoxImage.Warning,
+                MessageBoxResult.Cancel);
+            if (result == MessageBoxResult.Yes)
+            {
+                await _vm.DeleteGroupAsync(group.Id);
+            }
+        }
+        finally
+        {
+            _openDialogs--;
+            ScheduleAutoHide();
+        }
+    }
+
     private void AddGroupButton_Click(object sender, RoutedEventArgs e) => _ = OpenGroupDialogAsync(null);
 
     private async Task OpenGroupDialogAsync(Guid? groupId)
     {
-        _suppressAutoHide = true;
+        if (!_vm.CanChangeGroups || _openDialogs > 0)
+        {
+            return;
+        }
+
+        var current = groupId is { } id ? _vm.Groups.FirstOrDefault(group => group.Id == id) : null;
+        if (groupId is not null && current is null)
+        {
+            return;
+        }
+
+        _openDialogs++;
         ClosePreviewImmediate();
         try
         {
-            var current = groupId is { } id ? _vm.Groups.FirstOrDefault(group => group.Id == id) : null;
             var dialog = new TextPromptWindow(
                 groupId is null ? "新建分组" : "重命名分组",
                 "1–20 个字符，名称不可重复。",
@@ -636,14 +733,16 @@ public partial class QuickPanelWindow : Window
                         return "请输入分组名称。";
                     }
 
-                    if (TextExtraction.CountTextElements(trimmed) > StorageLimits.MaximumGroupNameCharacters)
+                    if (TextExtraction.CountTextElements(trimmed) > StorageLimits.MaximumGroupNameCharacters ||
+                        Encoding.UTF8.GetByteCount(value) > StorageLimits.MaximumGroupNameBytes ||
+                        Encoding.UTF8.GetByteCount(trimmed) > StorageLimits.MaximumGroupNameBytes)
                     {
-                        return $"分组名称最多 {StorageLimits.MaximumGroupNameCharacters} 个字符。";
+                        return $"分组名称最多 {StorageLimits.MaximumGroupNameCharacters} 个字符、{StorageLimits.MaximumGroupNameBytes} 字节。";
                     }
 
                     if (_vm.Groups.Any(group =>
                             group.Id != groupId &&
-                            string.Equals(group.Name, trimmed, StringComparison.CurrentCultureIgnoreCase)))
+                            GroupNames.Equal(group.Name, trimmed)))
                     {
                         return "已存在同名分组。";
                     }
@@ -665,7 +764,7 @@ public partial class QuickPanelWindow : Window
         }
         finally
         {
-            _suppressAutoHide = false;
+            _openDialogs--;
             ScheduleAutoHide();
         }
     }
@@ -761,7 +860,8 @@ public partial class QuickPanelWindow : Window
                 {
                     Header = group.Name,
                     IsCheckable = true,
-                    IsChecked = row.Clip.Groups.Contains(group.Id)
+                    IsChecked = row.Clip.Groups.Contains(group.Id),
+                    IsEnabled = _vm.CanChangeGroups
                 };
                 item.Click += (_, _) => _ = _vm.ToggleGroupAsync(row.Clip, group.Id);
                 groups.Items.Add(item);
@@ -769,7 +869,7 @@ public partial class QuickPanelWindow : Window
         }
 
         groups.Items.Add(new Separator());
-        var newGroup = new MenuItem { Header = "新建分组…" };
+        var newGroup = new MenuItem { Header = "新建分组…", IsEnabled = _vm.CanChangeGroups };
         newGroup.Click += (_, _) => _ = OpenGroupDialogAsync(null);
         groups.Items.Add(newGroup);
         menu.Items.Add(groups);
@@ -783,21 +883,32 @@ public partial class QuickPanelWindow : Window
 
     private async Task ConfirmDeleteAsync(ClipRow row)
     {
-        _suppressAutoHide = true;
-        var result = MessageBox.Show(
-            this,
-            "将移除内容及其分组关联，不会删除原文件。",
-            "删除这条记录？",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No);
-        _suppressAutoHide = false;
-        if (result == MessageBoxResult.Yes)
+        if (_openDialogs > 0)
         {
-            await _vm.DeleteAsync(row.Clip);
+            return;
         }
 
-        ScheduleAutoHide();
+        _openDialogs++;
+        ClosePreviewImmediate();
+        try
+        {
+            var result = MessageBox.Show(
+                this,
+                "将移除内容及其分组关联，不会删除原文件。",
+                "删除这条记录？",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+            if (result == MessageBoxResult.Yes)
+            {
+                await _vm.DeleteAsync(row.Clip);
+            }
+        }
+        finally
+        {
+            _openDialogs--;
+            ScheduleAutoHide();
+        }
     }
 
     private void ShowPreviewForClip(ClipRow row)
@@ -819,17 +930,12 @@ public partial class QuickPanelWindow : Window
 
     private void TrackMenu(ContextMenu menu)
     {
-        menu.Opened += (_, _) =>
-        {
-            _openMenus++;
-            _suppressAutoHide = true;
-        };
+        menu.Opened += (_, _) => _openMenus++;
         menu.Closed += (_, _) =>
         {
             _openMenus = Math.Max(0, _openMenus - 1);
             if (_openMenus == 0)
             {
-                _suppressAutoHide = false;
                 ScheduleAutoHide();
             }
         };
@@ -937,10 +1043,16 @@ public partial class QuickPanelWindow : Window
 
     private void ShowMessage(string message, string title)
     {
-        _suppressAutoHide = true;
-        MessageBox.Show(this, message, title, MessageBoxButton.OK, MessageBoxImage.Information);
-        _suppressAutoHide = false;
-        ScheduleAutoHide();
+        _openDialogs++;
+        try
+        {
+            MessageBox.Show(this, message, title, MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        finally
+        {
+            _openDialogs--;
+            ScheduleAutoHide();
+        }
     }
 
     private static T? FindAncestor<T>(DependencyObject? element) where T : DependencyObject
