@@ -13,6 +13,7 @@ xcrun swiftc -O -swift-version 6 -target arm64-apple-macosx26.5 -sdk "$SDK" \
   "$ROOT"/CVMaster/*.swift -lsqlite3 -o "$APP/Contents/MacOS/cvMaster"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/Resources/StatusIcon.png" "$APP/Contents/Resources/StatusIcon.png"
 # 仅清除新生成构建包的扩展属性，避免同步目录附加 Finder 元数据导致签名失败。
 xattr -cr "$APP"
 # 本机构建启用 hardened runtime，禁止隐式联网获取时间戳；分发仍需单独签名、公证。

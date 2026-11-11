@@ -12,7 +12,7 @@
 
 点击图标或全局快捷键，从图标下方唤出同一浮层。查找、切换分组、复制、置顶等核心动作均集中在这里；点击外部或 Esc 收起。设置仅是次级辅助窗口。
 
-原生实现位于 `native/`，使用 SwiftUI + AppKit，目标为 Apple Silicon / macOS 26.5。早期 `design/ui/` 三栏浏览器稿仅保留为视觉探索，不再代表当前交互方向。
+原生实现位于 `native/`，使用 SwiftUI + AppKit，目标为 Apple Silicon / macOS 26.5。
 
 ## 2. 视觉与结构
 

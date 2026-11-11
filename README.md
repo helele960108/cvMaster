@@ -96,7 +96,6 @@ cvMaster/
 │  ├─ packaging/              Inno Setup 配置（当前不发布安装包）
 │  ├─ build.ps1               构建、测试与自包含发布脚本
 │  └─ README.md               Windows 构建与使用说明
-├─ design/                    交互与视觉探索稿，不参与运行时构建
 ├─ docs/                      产品、架构、验证与隐私文档
 ├─ LICENSE                    Apache License 2.0
 ├─ NOTICE                     版权与第三方声明入口

@@ -1,5 +1,8 @@
 /**
- * UI 状态与后台存储用例协调：防抖查询、有界采集、按需预览及真实再次复制。
+ * UI 状态与后台存储用例协调的主类：已发布状态、防抖查询、按需预览与清理。
+ * 设置 / 采集 / 粘贴 / 分组用例位于 ClipboardLibrary+*.swift 扩展。
+ * 约定：Swift 无法让 private(set) 跨文件扩展可写，因此扩展需要写入的发布属性为普通 var；
+ * 视图层只读取这些属性，修改必须经由本类的方法，保持单一变更入口。
  * @author helele
  * @since 2026-10-19
  */
@@ -20,9 +23,9 @@ final class ClipboardLibrary: ObservableObject {
     static let accent = Color(red: 0.67, green: 0.33, blue: 0.18)
     /// 只保留当前最多 300 条元数据；关闭浮层后回收为首屏大小。
     @Published private(set) var clips: [Clip] = []
-    @Published private(set) var groups: [ClipGroup] = []
+    @Published var groups: [ClipGroup] = []
     /// 分组写入及权威目录回读期间阻止重复操作，不影响历史列表浏览。
-    @Published private(set) var changingGroups = false
+    @Published var changingGroups = false
     @Published private(set) var total = 0
     /// 全库条数与内容表示字节，仅供容量展示，不受当前搜索或筛选影响。
     @Published private(set) var storedEntries = 0
@@ -35,10 +38,7 @@ final class ClipboardLibrary: ObservableObject {
         didSet { if oldValue != timeRange { scheduleSearch() } }
     }
     /// 容器尺寸不发布给列表；拖动只调整原生窗口，结束后才保存偏好。
-    private(set) var panelHeight: CGFloat = {
-        let saved = UserDefaults.standard.double(forKey: "panelHeight")
-        return saved.isFinite && saved >= 420 ? min(saved, 1000) : 600
-    }()
+    private(set) var panelHeight: CGFloat = PanelMetrics.restoredHeight(UserDefaults.standard.double(forKey: PreferenceKey.panelHeight))
     /// 由原生容器限制实际可用屏幕高度并同步 popover 尺寸。
     var onResize: ((CGFloat) -> CGFloat)?
     /// 由原生容器在浮层显示后按状态图标的实际位置更新。
@@ -54,52 +54,52 @@ final class ClipboardLibrary: ObservableObject {
 
     func resizePanel(to height: CGFloat, persist: Bool = false) {
         guard height.isFinite else { return }
-        let requested = min(max(height, 420), 1000)
+        let requested = PanelMetrics.clamped(height)
         panelHeight = onResize?(requested) ?? requested
-        if persist { UserDefaults.standard.set(Double(panelHeight), forKey: "panelHeight") }
+        if persist { UserDefaults.standard.set(Double(panelHeight), forKey: PreferenceKey.panelHeight) }
     }
 
     @Published var selection: UUID?
     @Published var shortcutAvailable = true
     /// 当前全局快捷键；注册由应用代理执行，成功后才持久化。
-    @Published private(set) var globalShortcut = GlobalShortcut.load()
+    @Published var globalShortcut = GlobalShortcut.load()
     /// 最近一次录制失败或启动注册失败的原因。
-    @Published private(set) var shortcutConflict: String?
+    @Published var shortcutConflict: String?
     /// 应用代理注入：尝试注册新组合，返回冲突说明或 nil。
     var applyGlobalShortcut: ((GlobalShortcut) -> String?)?
     /// 辅助功能权限状态；浮层引导与设置页共用，每次从系统实时读取。
-    @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
+    @Published var accessibilityGranted = AXIsProcessTrusted()
     /// 系统授权提示每次应用运行最多触发一次，避免反复弹窗。
-    private var accessibilityPromptShown = false
+    var accessibilityPromptShown = false
     /// 登录项状态直接读取系统，不使用独立偏好副本。
-    @Published private(set) var launchAtLogin = false
+    @Published var launchAtLogin = false
     /// 已注册但等待用户在系统设置中批准。
-    @Published private(set) var launchAtLoginRequiresApproval = false
+    @Published var launchAtLoginRequiresApproval = false
     /// 外观偏好只存储枚举字符串；应用代理订阅变化并同步原生容器，不重建浮层或轮询服务。
-    @Published var appearance = AppAppearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system {
+    @Published var appearance = AppAppearance(rawValue: UserDefaults.standard.string(forKey: PreferenceKey.appearance) ?? "") ?? .system {
         didSet {
-            UserDefaults.standard.set(appearance.rawValue, forKey: "appearance")
+            UserDefaults.standard.set(appearance.rawValue, forKey: PreferenceKey.appearance)
         }
     }
     /// 首次使用默认不采集，必须在浮层明确开启；设置为独立布尔偏好。
-    @Published var recordingEnabled = UserDefaults.standard.bool(forKey: "recordingEnabled") {
-        didSet { UserDefaults.standard.set(recordingEnabled, forKey: "recordingEnabled"); monitor?.resetBaseline() }
+    @Published var recordingEnabled = UserDefaults.standard.bool(forKey: PreferenceKey.recordingEnabled) {
+        didSet { UserDefaults.standard.set(recordingEnabled, forKey: PreferenceKey.recordingEnabled); monitor?.resetBaseline() }
     }
-    @Published var paused = UserDefaults.standard.bool(forKey: "recordingPaused") {
+    @Published var paused = UserDefaults.standard.bool(forKey: PreferenceKey.recordingPaused) {
         didSet {
-            UserDefaults.standard.set(paused, forKey: "recordingPaused")
+            UserDefaults.standard.set(paused, forKey: PreferenceKey.recordingPaused)
             monitor?.resetBaseline()
         }
     }
     /// 0 表示不按时间清理；缺省仍为 30 天，容量上限始终生效。
-    @Published var retention = (UserDefaults.standard.object(forKey: "retentionDays") == nil
-        ? 30
-        : max(0, UserDefaults.standard.integer(forKey: "retentionDays"))) {
-        didSet { UserDefaults.standard.set(retention, forKey: "retentionDays") }
+    @Published var retention = (UserDefaults.standard.object(forKey: PreferenceKey.retentionDays) == nil
+        ? PreferenceDefault.retentionDays
+        : max(0, UserDefaults.standard.integer(forKey: PreferenceKey.retentionDays))) {
+        didSet { UserDefaults.standard.set(retention, forKey: PreferenceKey.retentionDays) }
     }
     /// 换行分隔的 bundle ID 配置，不将结构化对象序列化为 JSON。
-    @Published var excludedApplications = UserDefaults.standard.string(forKey: "excludedApplications") ?? "com.agilebits.onepassword7\ncom.1password.1password\ncom.apple.Passwords" {
-        didSet { UserDefaults.standard.set(excludedApplications, forKey: "excludedApplications") }
+    @Published var excludedApplications = UserDefaults.standard.string(forKey: PreferenceKey.excludedApplications) ?? PreferenceDefault.excludedApplications {
+        didSet { UserDefaults.standard.set(excludedApplications, forKey: PreferenceKey.excludedApplications) }
     }
     /// 设置页展示与采集共用的有序去重列表；空白行和重复 ID 不会产生多个条目。
     var excludedApplicationIDs: [String] {
@@ -114,7 +114,7 @@ final class ClipboardLibrary: ObservableObject {
     }
     @Published private(set) var feedback: String?
     @Published private(set) var loading = false
-    @Published private(set) var copying = false
+    @Published var copying = false
     @Published private(set) var preview: ClipPreview?
     @Published private(set) var previewLoading = false
     /// 写入剪贴板前校验当前激活的 APP 与辅助功能权限，失败时保留原剪贴板。
@@ -125,142 +125,33 @@ final class ClipboardLibrary: ObservableObject {
     var performPaste: (() async throws -> Void)?
     /// 生命周期由应用代理持有；监测器反向弱引用本对象。
     var monitor: ClipboardMonitor?
-    private let store = HistoryStore()
-    private let logger = Logger(subsystem: "local.helele.cvmaster", category: "library")
-    private var searchTask: Task<Void, Never>?
+    let store = HistoryStore()
+    let logger = Logger(subsystem: "local.helele.cvmaster", category: "library")
+    var searchTask: Task<Void, Never>?
     /// 清空等待已接收的写入结束，避免尚未进入存储 actor 的旧快照在清空后落盘。
-    private var captureTask: Task<Void, Never>?
-    private var captureGeneration: UInt64 = 0
+    var captureTask: Task<Void, Never>?
+    var captureGeneration: UInt64 = 0
     private var previewTask: Task<Void, Never>?
     /// 分组目录单独刷新，不被搜索防抖任务取消，也不接收历史页的旧目录。
-    private var groupsTask: Task<Void, Never>?
-    private var groupsVersion = 0
-    private var feedbackTask: Task<Void, Never>?
+    var groupsTask: Task<Void, Never>?
+    var groupsVersion = 0
+    var feedbackTask: Task<Void, Never>?
     /// 查询版本防止在 actor 等待期间过期结果覆盖新状态。
     private var searchVersion = 0
     private var previewVersion = 0
     private var limit = StorageLimits.pageSize
-    private var panelVisible = false
+    var panelVisible = false
     /// 清空过程中暂停新采集，防止用户确认清空后又插入先前排队内容。
-    private var clearing = false
+    var clearing = false
     /// 采集无积压队列；后台写入未完成时丢弃后续变化并计数，不无限保存 Data。
-    private(set) var captureBusy = false
-    private var skippedChanges = 0
+    var captureBusy = false
+    var skippedChanges = 0
 
     var visibleClips: [Clip] { clips }
     var selectedClip: Clip? { clips.first { $0.id == selection } }
     var hasMore: Bool { clips.count < total && clips.count < StorageLimits.maximumLoaded }
 
     func start() { refreshGroups(); scheduleSearch(); refreshAccessibilityStatus(); refreshLaunchAtLoginStatus() }
-
-    /// 重新读取系统授权状态；打开浮层、应用激活和进入设置时调用，不做定时轮询。
-    func refreshAccessibilityStatus() {
-        let granted = AXIsProcessTrusted()
-        if granted != accessibilityGranted {
-            accessibilityGranted = granted
-            // 重新授权后复位，未来若再次撤销权限仍可触发一次系统提示。
-            if granted { accessibilityPromptShown = false }
-        }
-    }
-
-    /// 首次缺少权限时触发系统授权提示，确保应用出现在辅助功能列表中。
-    func promptForAccessibilityIfNeeded() {
-        guard !AXIsProcessTrusted(), !accessibilityPromptShown else { return }
-        accessibilityPromptShown = true
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-    }
-
-    /// 首次点击先走系统授权提示，之后直接打开辅助功能设置页。
-    func openAccessibilitySettings() {
-        guard !AXIsProcessTrusted() else { refreshAccessibilityStatus(); return }
-        if !accessibilityPromptShown {
-            promptForAccessibilityIfNeeded()
-            return
-        }
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
-        refreshAccessibilityStatus()
-    }
-
-    /// 读取系统登录项状态；应用激活或进入设置时调用，不维护独立偏好副本。
-    func refreshLaunchAtLoginStatus() {
-        let status = SMAppService.mainApp.status
-        launchAtLogin = status == .enabled || status == .requiresApproval
-        launchAtLoginRequiresApproval = status == .requiresApproval
-    }
-
-    /// 注册或移除登录项；需要用户批准时保持开启状态，并在设置页给出入口。
-    func setLaunchAtLogin(_ enabled: Bool) {
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else if launchAtLogin {
-                // 系统设置中可能已关闭该项；状态未标记为开启时不重复调用 unregister。
-                try SMAppService.mainApp.unregister()
-            }
-            refreshLaunchAtLoginStatus()
-            if launchAtLoginRequiresApproval {
-                notify("登录项已注册，请在系统设置 → 通用 → 登录项中允许 cvMaster")
-            } else if launchAtLogin == enabled {
-                notify(enabled ? "已开启登录时启动" : "已关闭登录时启动")
-            } else {
-                notify("登录项状态未改变，请在系统设置中检查")
-            }
-        } catch {
-            refreshLaunchAtLoginStatus()
-            notify("无法更新登录时启动：\(error.localizedDescription)")
-        }
-    }
-
-    /// 打开系统设置 → 通用 → 登录项，供待批准状态使用。
-    func openLoginItemsSettings() {
-        SMAppService.openSystemSettingsLoginItems()
-    }
-
-    /// 应用代理回写真实注册状态；启动注册失败或恢复失败时由代理调用。
-    func setShortcutRegistration(available: Bool, conflict: String?) {
-        shortcutAvailable = available
-        shortcutConflict = conflict
-    }
-
-    /// 先校验组合，再交由应用代理注册；失败保留原快捷键并显示原因。
-    @discardableResult
-    func updateGlobalShortcut(_ shortcut: GlobalShortcut) -> Bool {
-        if shortcut == globalShortcut, shortcutAvailable {
-            shortcutConflict = nil
-            return true
-        }
-        if let message = shortcut.validationMessage {
-            shortcutConflict = message
-            return false
-        }
-        guard let applyGlobalShortcut else {
-            shortcutConflict = "快捷键服务尚未就绪"
-            return false
-        }
-        if let error = applyGlobalShortcut(shortcut) {
-            shortcutConflict = error
-            return false
-        }
-        shortcutConflict = nil
-        shortcutAvailable = true
-        globalShortcut = shortcut
-        shortcut.save()
-        return true
-    }
-
-    /// 开始录制新组合时清除上一次的校验失败提示；注册服务本身不可用时保留原因。
-    func clearShortcutConflict() {
-        guard shortcutAvailable else { return }
-        shortcutConflict = nil
-    }
-
-    /// 恢复默认 ⇧⌘V；同样经过冲突检查。
-    func resetGlobalShortcut() {
-        updateGlobalShortcut(.defaultShortcut)
-    }
 
     /// 设置页打开时刷新全库容量统计，不受当前搜索、分组或时间筛选影响。
     func refreshStorageStats() {
@@ -336,128 +227,6 @@ final class ClipboardLibrary: ObservableObject {
         let current = clips.firstIndex { $0.id == selection } ?? 0
         selection = clips[min(max(current + offset, 0), clips.count - 1)].id
     }
-
-    /// 添加排除项；返回面向用户的错误，成功时只更新持久化配置，由调用方给出提示。
-    @discardableResult
-    func addExcludedApplication(_ bundleID: String) -> String? {
-        let trimmed = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.range(of: #"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$"#, options: .regularExpression) != nil else {
-            return "请输入有效的 Bundle ID，例如 com.example.app"
-        }
-        let ids = excludedApplicationIDs
-        guard !ids.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) else {
-            return "该应用已在排除列表中"
-        }
-        excludedApplications = (ids + [trimmed]).joined(separator: "\n")
-        return nil
-    }
-
-    /// 移除排除项；不存在时不做写入，避免无意义地触发偏好刷新。
-    func removeExcludedApplication(_ bundleID: String) {
-        let ids = excludedApplicationIDs
-        guard ids.contains(where: { $0.caseInsensitiveCompare(bundleID) == .orderedSame }) else { return }
-        excludedApplications = ids
-            .filter { $0.caseInsensitiveCompare(bundleID) != .orderedSame }
-            .joined(separator: "\n")
-    }
-
-    /// 主线程只移交有界快照；哈希、去重、写文件和关系操作都在 actor 上执行。
-    func accept(_ capture: ClipCapture) {
-        guard recordingEnabled, !paused, !captureBusy, !clearing,
-              !(monitor?.isCaptureBlocked() ?? false) else { skippedChange(); return }
-        captureBusy = true
-        let generation = captureGeneration
-        let days = retention
-        captureTask = Task { [weak self, store] in
-            guard let self else { return }
-            // 锁屏、暂停或清空可能发生在排队之后；保存前比对隐私代数。
-            guard generation == self.captureGeneration,
-                  !(self.monitor?.isCaptureBlocked() ?? false) else {
-                self.captureBusy = false
-                self.captureTask = nil
-                return
-            }
-            do {
-                try await store.save(capture, retention: days)
-                // 保存期间锁屏或清空时，保存无法回滚，但不能再刷新列表暴露内容。
-                let invalidated = generation != self.captureGeneration
-                self.captureBusy = false
-                self.captureTask = nil
-                guard !invalidated else { return }
-                if self.panelVisible { self.scheduleSearch() }
-            } catch {
-                let invalidated = generation != self.captureGeneration
-                self.captureBusy = false
-                self.captureTask = nil
-                guard !invalidated else { return }
-                self.report(error)
-            }
-        }
-    }
-
-    /// 锁屏时作废已接收但尚未落盘的快照；在途任务结束前保持 captureBusy，避免旧保存与新采集交叉。
-    /// 已进入 SQLite 事务的保存无法回滚。
-    func invalidatePendingCapture() {
-        captureGeneration &+= 1
-        guard let captureTask else {
-            captureBusy = false
-            return
-        }
-        captureTask.cancel()
-    }
-
-    func skippedChange() {
-        skippedChanges += 1
-        logger.notice("Capture skipped under backpressure; count: \(self.skippedChanges)")
-    }
-
-    /// 粘贴前校验目标并后台读取原始表示，准备成功后才清空剪贴板；自写 changeCount 由监测器跳过。
-    /// plainText 为 true 时仅对文本 / 链接生效，转换完成后才写回系统剪贴板。
-    func paste(_ clip: Clip, plainText: Bool = false) {
-        guard !copying, !loading else { return }
-        guard !plainText || clip.kind == .text || clip.kind == .link else { return }
-        do {
-            guard let validatePasteTarget, preparePasteTarget != nil, performPaste != nil else { throw LibraryError.pasteTargetUnavailable }
-            try validatePasteTarget()
-        } catch { report(error); return }
-        copying = true
-        Task { [weak self, store] in
-            do {
-                let representations: [ClipRepresentation]
-                if plainText { representations = try await store.plainText(clip.id, kind: clip.kind) }
-                else { representations = try await store.representations(clip.id) }
-                guard let self else { return }
-                var items: [Int: NSPasteboardItem] = [:]
-                for representation in representations {
-                    let item = items[representation.item] ?? NSPasteboardItem()
-                    // 写入临时 item 失败时不清空系统剪贴板，避免返回不完整的多格式内容。
-                    guard item.setData(representation.data, forType: NSPasteboard.PasteboardType(representation.type)) else {
-                        throw LibraryError.missingContent
-                    }
-                    items[representation.item] = item
-                }
-                guard let preparePasteTarget = self.preparePasteTarget else { throw LibraryError.pasteTargetUnavailable }
-                try await preparePasteTarget()
-                // 深度检查包含挂起点，写入前再次检查权限与交接状态，中间不再 await。
-                guard let validatePasteTarget = self.validatePasteTarget else { throw LibraryError.pasteTargetUnavailable }
-                try validatePasteTarget()
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                guard pasteboard.writeObjects(items.keys.sorted().compactMap { items[$0] }) else {
-                    self.monitor?.resetBaseline(); throw LibraryError.missingContent
-                }
-                self.monitor?.resetBaseline()
-                // 读取期间目标可能已关闭；原生层重新校验，失败不会向其他窗口发送内容。
-                guard let performPaste = self.performPaste else { throw LibraryError.pasteTargetUnavailable }
-                try await performPaste()
-                self.copying = false
-                // 仅在粘贴事件已发送后记录使用次数，不把写入剪贴板当作粘贴成功。
-                do { try await store.markCopied(clip.id) }
-                catch { self.report(error) }
-            } catch { self?.copying = false; self?.report(error) }
-        }
-    }
-
     /// 每次只保留一个详情；查询代数防止切换条目后旧缩略图覆盖新条目。
     func loadPreview(_ id: UUID?) {
         previewVersion += 1
@@ -488,93 +257,6 @@ final class ClipboardLibrary: ObservableObject {
         return try? await store.thumbnail(id)
     }
 
-    func setPinned(_ clip: Clip) {
-        mutate { try await $0.setPinned(clip.id, !clip.pinned) }
-    }
-
-    func setGroup(_ clip: Clip, group: UUID, included: Bool) {
-        guard !changingGroups else { return }
-        mutate { try await $0.setGroup(clip.id, group: group, included: included) }
-    }
-
-    func saveGroup(_ id: UUID?, name: String) {
-        changeGroups { try await $0.saveGroup(id, name: name) }
-    }
-
-    func deleteGroup(_ id: UUID) {
-        changeGroups(deleting: id) { try await $0.deleteGroup(id) }
-    }
-
-    func moveGroup(_ id: UUID, offset: Int) {
-        changeGroups { try await $0.moveGroup(id, offset: offset) }
-    }
-
-    /// 写入不随浮层关闭而取消；只回读分组目录，删除时才刷新历史归属。
-    private func changeGroups(deleting id: UUID? = nil,
-                              _ action: @escaping @Sendable (HistoryStore) async throws -> Void) {
-        guard !changingGroups else { return }
-        changingGroups = true
-        groupsVersion += 1
-        groupsTask?.cancel()
-        groupsTask = nil
-        Task { [weak self, store] in
-            defer { self?.changingGroups = false }
-            var committed = false
-            do {
-                try await action(store)
-                committed = true
-            } catch { self?.report(error) }
-            guard let self else { return }
-            var scopeChanged = false
-            do {
-                let groups = try await store.groupCatalog()
-                scopeChanged = self.applyGroupCatalog(groups)
-            } catch {
-                self.report(error)
-                // 删除已提交但目录读取失败时，不能继续展示确定已删除的筛选。
-                if committed, let id {
-                    self.groups.removeAll { $0.id == id }
-                    if self.scope == id.uuidString {
-                        self.scope = "all"
-                        scopeChanged = true
-                    }
-                }
-            }
-            if committed, id != nil, !scopeChanged {
-                self.scheduleSearch(resetLimit: false)
-            }
-        }
-    }
-
-    /// 只对成功读取的目录修复失效 scope；启动时的空数组不能作为删除依据。
-    @discardableResult
-    private func applyGroupCatalog(_ groups: [ClipGroup]) -> Bool {
-        self.groups = groups
-        if let id = UUID(uuidString: scope), !groups.contains(where: { $0.id == id }) {
-            scope = "all"
-            return true
-        }
-        return false
-    }
-
-    /// 分组规模上限 100，独立目录读取成本小，使用版本号防止旧结果覆盖。
-    func refreshGroups() {
-        guard !changingGroups else { return }
-        groupsVersion += 1
-        let version = groupsVersion
-        groupsTask?.cancel()
-        groupsTask = Task { [weak self, store] in
-            do {
-                let groups = try await store.groupCatalog()
-                guard let self, !Task.isCancelled, self.groupsVersion == version else { return }
-                self.applyGroupCatalog(groups)
-            } catch {
-                guard !Task.isCancelled else { return }
-                self?.report(error)
-            }
-        }
-    }
-
     func delete(_ id: UUID) { mutate { try await $0.delete(id) } }
     /// 清空全部历史，保留分组结构；清理完成后刷新列表与容量统计。
     func clear() {
@@ -586,7 +268,7 @@ final class ClipboardLibrary: ObservableObject {
         performClear(before: cutoff)
     }
 
-    private func performClear(before cutoff: Date?) {
+    func performClear(before cutoff: Date?) {
         guard !clearing else { return }
         clearing = true
         let pendingCapture = captureTask
@@ -615,7 +297,7 @@ final class ClipboardLibrary: ObservableObject {
         }
     }
 
-    private func mutate(_ action: @escaping @Sendable (HistoryStore) async throws -> Void) {
+    func mutate(_ action: @escaping @Sendable (HistoryStore) async throws -> Void) {
         Task { [weak self, store] in
             do { try await action(store); self?.scheduleSearch() }
             catch { self?.report(error) }
@@ -632,7 +314,7 @@ final class ClipboardLibrary: ObservableObject {
         }
     }
 
-    private func report(_ error: Error) {
+    func report(_ error: Error) {
         if let error = error as? LibraryError {
             // 仅输出预定义错误码，便于区分授权 / 焦点问题，不记录用户内容。
             logger.error("Local operation failed: \(String(describing: error), privacy: .public)")

@@ -53,16 +53,9 @@
 
 ## 设计素材
 
-### 应用图标与界面探索稿
+### 应用图标
 
-`native/Resources/`、`windows/src/CvMaster/Assets/` 与 `design/` 中的图标、界面探索稿由
-项目维护者提供并用于本项目。若后续替换为第三方素材，应在合并前补充来源、作者和许可证。
-
-### Lucide 图标名称
-
-`design/` 下的静态探索稿使用 `data-lucide` 属性表达图标语义，但仓库未包含 Lucide
-源码、图标字体或构建产物，因此当前不构成对 Lucide 的分发。若后续打包 Lucide，
-需遵守其 ISC 许可证并补充声明。
+`native/Resources/` 与 `windows/src/CvMaster/Assets/` 中的图标由项目维护者提供并用于本项目。若后续替换为第三方素材，应在合并前补充来源、作者和许可证。
 
 ### 字体
 

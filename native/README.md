@@ -6,6 +6,22 @@
 
 > 当前仓库处于源码预览阶段，不提供签名安装包。构建脚本只生成本机 `.build/cvMaster.app`，开发签名不等于 Developer ID 分发签名或公证。数据范围、权限与删除边界见 [`docs/隐私与数据说明.md`](../docs/隐私与数据说明.md)。
 
+## 源码结构
+
+`native/CVMaster/` 按职责分文件；跨文件扩展共享的状态在主类里声明，视图层只读取，修改必须经由主类的方法。
+
+| 区域 | 文件 |
+| --- | --- |
+| 启动与菜单栏 | `CVMasterApp`（入口与浮层）、`StatusAppDelegate+Paste`（粘贴交接）、`StatusAppDelegate+Shortcut`（Carbon 热键）、`SingleInstanceLock` |
+| 状态与用例 | `ClipboardLibrary` 及 `+Settings` / `+Capture` / `+Paste` / `+Groups`；`Preferences`（偏好键、默认值、浮层尺寸） |
+| 采集 | `ClipboardMonitor`、`ClipboardCapturePolicy`、`SessionLockState` |
+| 存储 | `HistoryStore` 及 `+SQLite` / `+Schema` / `+Query` / `+Mutation` / `+Groups` / `+Content` / `+Assets` / `+Thumbnails`；`FileAvailability`、`ThumbnailCache`、`ThumbnailPipeline` |
+| 模型与限额 | `Models`、`StorageLimits`（限额与有界文本）、`ClipTimeRange` |
+| 粘贴目标 | `PasteTarget`、`PasteHandoffPolicy`、`PasteFocusRestoration` |
+| 界面 | `QuickPanelView`、`PermissionBanner`、`SidePreviewView`、`ClipCardContent`、`PanelInteraction`、`SourceAppIcon`、`PreferencesView`、`ShortcutRecorder`、`ExcludedApplicationsSettings` |
+
+`native/Validation/` 的隔离回归入口为 `RegressionChecks.swift`，按主题拆为 `ChecksStorage` / `ChecksGroups` / `ChecksPrivacy` / `ChecksCapture` / `ChecksPaste` / `ChecksThumbnails` / `ChecksBenchmark`，共享夹具在 `CheckSupport.swift`；真实 AX 回归为 `AXChecks` + `AXTargetApp`。
+
 ## 运行形态
 
 Apple Silicon、macOS 26.5、Swift 6、SwiftUI + AppKit。常驻菜单栏图标，无主窗口、无 Dock 图标。点击图标或全局 `⇧⌘V` 从图标下方展开唯一的 350 × 600 pt 浮层。点击外部、Esc 或执行粘贴时收起。
@@ -59,7 +75,7 @@ open ./native/.build/cvMaster.app
 
 - UI 仅保留首屏 60 条轻量元数据；按需加载，最多 300 条，之后使用搜索缩小范围；关闭浮层缩回 60 条。
 - 数据库读写、哈希、搜索、清理和应用资产读取在存储 actor 执行，不在主线程扫描历史。缩略图原图读取 / ImageIO 解码使用专属 GCD 队列最多两个实际未结束工作，零待执行工作队列；最多等待 3 秒，超时 / 取消不释放尚未真正结束的许可。busy 只做有界重试，真实失败进入有界冷却，避免异常挂载点不断新增阻塞线程。原文件引用的可读性检查也在 actor 外有界执行。
-- 搜索 140 ms 防抖，3 个及以上 Unicode 码点在支持时使用 FTS5 trigram 候选加转义 LIKE 复核；1–2 码点或能力不可用时回退 LIKE。取消在查询入口 / 语句间 / 行间生效，不中断正在执行的 SQLite 语句；版本标识拒绝过期结果。分组一次批量读取，容量统计只在内容变更后重算。
+- 搜索 140 ms 防抖，3 个及以上 Unicode 码点在支持时先对 FTS5 trigram 做最多 1,024 个候选的有界探测：低于阈值才使用候选并以转义 LIKE 复核，达到阈值（高命中）直接顺序 LIKE；1–2 码点或能力不可用时同样回退 LIKE。结果集与索引选择无关。取消在查询入口 / 语句间 / 行间生效，不中断正在执行的 SQLite 语句；版本标识拒绝过期结果。分组一次批量读取，容量统计只在内容变更后重算。
 - 一次最多一个采集写入，无无限增长的快照队列。处理期间新变化可能跳过，日志仅记录计数，不记录正文或路径。
 - 单种表示最多 8 MB、单条总量最多 16 MB、最多 24 个表示；列表不持有原始内容。派生标题 / 摘要分别最多 120 字符 / 4 KiB、240 字符 / 8 KiB，整条搜索文本共享 32,768 字符 / 128 KiB 输出预算；来源显示名和 Bundle ID 各最多 1 KiB（超长 ID 置空，不截成另一身份）。以 Unicode scalar 安全截断，组合字素也不能绕过字节限额；原始复制表示不受这些元数据限额截断。搜索词最多 256 字符 / 8 KiB，分组名最多 20 字符 / 1 KiB，超限分组明确拒绝。
 - 单个预览最多 16 KB 文本或 420 px 小图，展示图像只在结果变化时构造，关闭后释放引用；来源图标维持 MainActor 绘制与既有有界缓存，冷解析 / 栅格化提供无内容 signpost 供 Instruments 量测。
@@ -81,9 +97,9 @@ open ./native/.build/cvMaster.app
 
 ## 应用图标
 
-暂用用户确认的暖白 / 铜橙剪贴板图案。原图保存在 `Resources/AppIcon.png`，标准 macOS 多尺寸图标为 `Resources/AppIcon.icns`，打包时复制到应用资源目录，由 `CFBundleIconFile` 引用。
+使用已确认的单色圆润 CV 字标，不再保留暖白 / 铜橙剪贴板图案或彩色底板。矢量源为 `Resources/AppIcon.svg`，透明深色主图为 `Resources/AppIcon.png`，标准 macOS 多尺寸图标为 `Resources/AppIcon.icns`，由 `CFBundleIconFile` 引用。
 
-更换原图后执行 `./native/scripts/generate-icon.sh` 重新生成 16–1024 px 普通与 Retina 尺寸，再构建应用。源图保持原样，不额外裁切或改变背景。菜单栏同样使用该图标，以 18 pt 彩色方式显示，启动时一次性生成透明圆角小图，柔化方形背景边缘；资源不可用时回退到系统剪贴板符号。
+更换主图后执行 `./native/scripts/generate-icon.sh`，生成 16–1024 px 普通与 Retina 尺寸及 `Resources/StatusIcon.png`，再构建应用。菜单栏使用单独裁去留白的 CV 透明模板图，最长边 18 pt、保持宽高比，由系统适配明暗和选中态；不添加底板或圆角裁剪。图标仅在启动时加载，资源不可用时回退到系统剪贴板符号。Windows 图标也由该主图派生；安装 Python / Pillow 后，可执行 `python3 windows/tools/check-icons.py` 检查两端资源一致性。
 
 ## 纯文本粘贴
 

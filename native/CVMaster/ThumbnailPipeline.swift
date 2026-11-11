@@ -1,3 +1,8 @@
+/**
+ * 有界的缩略图图像 I/O：固定工作槽、调用者截止时间与同源合并，不为卡死的系统调用新增线程。
+ * @author helele
+ * @since 2026-10-20
+ */
 import Foundation
 import Dispatch
 import Darwin

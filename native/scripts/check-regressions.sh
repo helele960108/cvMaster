@@ -43,15 +43,21 @@ printf 'Isolated Swift 6 optimized validation (%s, SDK %s)\n' "$ARCH" "$(xcrun -
 xcrun swiftc -O -swift-version 6 -target "$ARCH-apple-macosx26.5" -sdk "$SDK" \
   -module-cache-path "$WORK/module-cache" -parse-as-library \
   "$ROOT/CVMaster/Models.swift" \
+  "$ROOT/CVMaster/StorageLimits.swift" \
+  "$ROOT/CVMaster/ClipTimeRange.swift" \
+  "$ROOT/CVMaster/Preferences.swift" \
   "$ROOT/CVMaster/GlobalShortcut.swift" \
   "$ROOT/CVMaster/SingleInstanceLock.swift" \
-  "$ROOT/CVMaster/HistoryStore.swift" \
+  "$ROOT"/CVMaster/HistoryStore*.swift \
+  "$ROOT/CVMaster/FileAvailability.swift" \
+  "$ROOT/CVMaster/ThumbnailCache.swift" \
   "$ROOT/CVMaster/ThumbnailPipeline.swift" \
   "$ROOT/CVMaster/ClipboardCapturePolicy.swift" \
   "$ROOT/CVMaster/SessionLockState.swift" \
   "$ROOT/CVMaster/PasteHandoffPolicy.swift" \
   "$ROOT/CVMaster/PasteFocusRestoration.swift" \
   "$ROOT/Validation/SingleInstanceChecks.swift" \
+  "$ROOT"/Validation/Check*.swift \
   "$ROOT/Validation/RegressionChecks.swift" \
   -lsqlite3 -o "$WORK/regression-checks"
 if [ "${#ARGS[@]}" -gt 0 ]; then

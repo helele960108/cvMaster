@@ -47,6 +47,17 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - `%ProgramFiles(x86)%\dotnet\dotnet.exe`
 - `%USERPROFILE%\.dotnet\dotnet.exe`
 
+## 应用图标
+
+使用与 macOS 一致的透明底、单色圆润 CV 标志。主图为 `native/Resources/AppIcon.png`，矢量源为相邻的 `AppIcon.svg`；不再生成旧铜橙剪贴板。安装 Python / Pillow 后，在仓库根目录执行：
+
+```bash
+python3 windows/tools/generate-icon.py
+python3 windows/tools/check-icons.py
+```
+
+生成 `Assets/app.png`（1024 px）及九尺寸 `Assets/app.ico`（16–256 px）。ICO 编译嵌入 EXE，托盘和快捷方式取 EXE 内嵌图标，因此更换后须重新构建并退出旧进程再启动；仅复制 Assets 不会更新运行中的托盘。Windows 使用固定深色标志，浅 / 深色任务栏下的实际对比度仍需 Windows 人工验收，不宣称像 macOS 模板图一样自动反色。
+
 ## 本地部署
 
 ```powershell

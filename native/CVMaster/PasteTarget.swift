@@ -397,8 +397,9 @@ final class PasteTargetWorker: @unchecked Sendable {
     /// 仅 .noValue / .attributeUnsupported 表示未暴露节点；超时、无效引用、错误类型均拒绝。
     private func element(_ owner: AXUIElement, attribute: String, deadline: ContinuousClock.Instant) throws -> AXUIElement? {
         guard let value = try attributeValue(owner, attribute: attribute, deadline: deadline) else { return nil }
+        // CFTypeRef 到 AXUIElement 的桥接不能用条件转换表达；先核对 CFTypeID，再做必然成功的强转。
         guard CFGetTypeID(value) == AXUIElementGetTypeID() else { throw Failure.unavailable }
-        return (value as! AXUIElement)
+        return unsafeDowncast(value, to: AXUIElement.self)
     }
 
     private func attributeValue(_ owner: AXUIElement, attribute: String, deadline: ContinuousClock.Instant) throws -> CFTypeRef? {
