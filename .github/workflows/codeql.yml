@@ -1,0 +1,61 @@
+# CodeQL 高级配置：默认配置无法编译 Swift，这里用 macOS 构建脚本覆盖 Swift，其余语言免编译扫描。
+# 启用本文件后需在仓库设置中关闭 CodeQL 默认配置，二者不能同时生效。
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: 分析 (${{ matrix.language }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: swift
+            os: macos-26
+            build-mode: manual
+          - language: csharp
+            os: ubuntu-latest
+            build-mode: none
+          - language: python
+            os: ubuntu-latest
+            build-mode: none
+          - language: actions
+            os: ubuntu-latest
+            build-mode: none
+    steps:
+      # 依赖固定到提交 SHA，避免标签被改写后拉取到非预期代码。
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 初始化 CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      # runner 没有开发证书，构建脚本会回退临时签名，只用于让 CodeQL 跟踪编译。
+      - name: 构建 macOS 客户端
+        if: matrix.language == 'swift'
+        run: ./native/scripts/build-app.sh
+
+      - name: 执行分析
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: "/language:${{ matrix.language }}"
