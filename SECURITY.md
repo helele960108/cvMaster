@@ -17,7 +17,7 @@ cvMaster 目前处于 `0.1.0` 源码预览阶段，尚未提供正式安装包�
 
 > 仓库页面 → **Security** → **Advisories** → **Report a vulnerability**
 
-如果该入口暂不可用，请先创建一个**不含漏洞细节**的 Issue，说明“需要私下安全渠道”，由维护者跟进。不要在公开讨论中补充细节。
+如果该入口暂不可用，请发送邮件至 [helele0108@163.com](mailto:helele0108@163.com)，标题注明“cvMaster 安全问题”。不要在公开 Issue 或讨论中披露细节。
 
 报告中请尽量包含：
 
