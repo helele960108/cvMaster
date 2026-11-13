@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>cvMaster：本地优先的剪贴板管理工具</title>
+  <meta name="description" content="cvMaster 是 macOS 与 Windows 上的原生剪贴板管理工具。历史只保存在本机，应用不发起网络请求，没有账号、云同步和遥测。">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="cvMaster">
+      <svg class="mark" viewBox="0 0 1024 1024" aria-hidden="true"><path d="M 471 668 H 340 C 245 668 168 598 168 512 C 168 426 245 356 340 356 H 491 Q 501 356 507 366 L 659 646 Q 674 674 690 646 L 856 356"/></svg>
+      <span>cvMaster</span>
+    </a>
+    <nav class="topnav">
+      <button class="pill" type="button" id="lang-toggle" lang="en">English</button>
+      <a class="pill" href="https://github.com/helele960108/cvMaster">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <h1 data-i18n-html="hero.title">剪贴板历史，<br>不离开这台电脑。</h1>
+        <p class="lede" data-i18n="hero.lede">macOS 与 Windows 上的原生剪贴板工具。应用不联网，不需要账号，默认不记录。</p>
+        <div class="actions">
+          <a class="btn primary" href="https://github.com/helele960108/cvMaster" data-i18n="hero.cta">在 GitHub 查看源码</a>
+        </div>
+        <p class="status" data-i18n-html="hero.status">0.1.0 源码预览，暂不提供安装包，需要<a href="https://github.com/helele960108/cvMaster#快速开始">从源码构建</a>。</p>
+      </div>
+
+      <figure class="stage">
+        <div class="popover" id="demo" aria-label="cvMaster">
+          <div class="pop-head">
+            <strong>cvMaster</strong>
+            <span class="local" data-i18n="demo.local">仅本机</span>
+          </div>
+          <label class="search">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+            <input id="demo-search" type="search" autocomplete="off" spellcheck="false" placeholder="搜索" data-i18n-placeholder="demo.search">
+          </label>
+          <div class="chips" id="demo-groups" role="tablist"></div>
+          <ul class="list" id="demo-list" role="listbox" tabindex="0"></ul>
+          <div class="pop-foot">
+            <span id="demo-feedback" aria-live="polite"></span>
+            <kbd>⇧⌘V</kbd>
+          </div>
+        </div>
+        <figcaption data-i18n="demo.caption">示意浮层，可点击或用 ↑ ↓ 回车操作。网页不会读取你的剪贴板。</figcaption>
+      </figure>
+    </section>
+
+    <section class="promises" aria-labelledby="promises-title">
+      <h2 id="promises-title" data-i18n="p.title">四条承诺</h2>
+      <dl>
+        <div>
+          <dt data-i18n="p.net">不联网</dt>
+          <dd data-i18n="p.netd">应用不发起网络请求。没有账号、云同步、遥测、广告或崩溃上传，代码里没有 HTTP 客户端和 WebView。</dd>
+        </div>
+        <div>
+          <dt data-i18n="p.local">只存在本机</dt>
+          <dd data-i18n="p.locald">历史、设置和原始内容都在本机用户目录。macOS 版把数据目录权限收紧为仅自己可读写。</dd>
+        </div>
+        <div>
+          <dt data-i18n="p.off">默认不记录</dt>
+          <dd data-i18n="p.offd">由你手动开启，只记录开启后的新复制。锁屏、睡眠和安全输入期间自动跳过。</dd>
+        </div>
+        <div>
+          <dt data-i18n="p.safe">避开敏感内容</dt>
+          <dd data-i18n="p.safed">识别剪贴板的隐私标记，默认排除常见密码管理器。剪贴板内容不进日志，HTML 不渲染。</dd>
+        </div>
+      </dl>
+      <p class="note" data-i18n-html="p.limits">限制也写在这里：没有应用级静态加密；不是所有密码管理器都会设置隐私标记；检查文件引用时，系统可能访问你复制的云盘或网络共享路径。完整说明见<a href="https://github.com/helele960108/cvMaster/blob/main/docs/隐私与数据说明.md">隐私与数据说明</a>。</p>
+    </section>
+  </main>
+
+  <footer>
+    <p data-i18n="foot.platforms">macOS 26.5+（Apple Silicon，SwiftUI）与 Windows 10/11（.NET 10，WPF），两端都是原生应用。</p>
+    <p data-i18n-html="foot.license">以 <a href="https://github.com/helele960108/cvMaster/blob/main/LICENSE">Apache License 2.0</a> 开源。安全问题请按 <a href="https://github.com/helele960108/cvMaster/blob/main/SECURITY.md">SECURITY.md</a> 私下报告。</p>
+    <p>Copyright 2026 helele and cvMaster contributors</p>
+  </footer>
+</body>
+</html>
