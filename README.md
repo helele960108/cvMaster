@@ -2,7 +2,7 @@
 
 本地优先的剪贴板管理工具。macOS 版是菜单栏应用，Windows 版是原生 WPF 托盘应用；两端共享同一套产品约束：默认不记录、只在本机工作、内容不进入日志、大内容按需读取。
 
-**项目状态：0.1.0 源码预览。** 当前仓库以源码和本地构建为主，**暂不提供安装包**；macOS 与 Windows 的界面、权限和跨应用粘贴仍在持续验收，不能把现有测试结果理解为面向所有环境的稳定版承诺。
+**项目状态：0.1.0 预览版。** [Releases](https://github.com/helele960108/cvMaster/releases) 提供 macOS（Apple Silicon）预览包，未经 Apple 公证；Windows 暂不提供安装包，需从源码构建。macOS 与 Windows 的界面、权限和跨应用粘贴仍在持续验收，不能把现有测试结果理解为面向所有环境的稳定版承诺。
 
 ## 平台与支持范围
 
@@ -22,6 +22,20 @@
 - 分组、置顶、类型筛选、时间筛选、搜索和保留策略与 macOS 版保持同一信息架构。
 - 默认排除常见密码管理器，并识别系统剪贴板隐私标记。
 - 自动粘贴优先恢复打开列表时的原窗口 / 输入节点；有 AX 快照时严格校验，窗口变化或切换到其他输入框会拒绝，快照不可用时退化为当前 active responder。目标身份、权限或前台状态不满足时拒绝写入或发送。
+
+## 下载
+
+macOS 预览包在 [Releases](https://github.com/helele960108/cvMaster/releases)，要求 Apple Silicon、macOS 26.5 及以上。下载 `cvMaster-<版本>-macos-arm64.zip`，解压后把 `cvMaster.app` 拖进「应用程序」。
+
+预览包使用临时签名，没有 Developer ID 签名和公证，首次打开会被 Gatekeeper 拦截。可以在 Finder 中右键 `cvMaster.app` 选择「打开」，或在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/cvMaster.app
+```
+
+临时签名的辅助功能授权绑定具体构建，升级新版本后可能需要在「系统设置 › 隐私与安全性 › 辅助功能」中删除旧条目再重新授权。Release 说明里附有 SHA-256，可用 `shasum -a 256` 核对。
+
+Windows 暂无安装包，请按下文从源码构建。
 
 ## 快速开始
 
@@ -93,7 +107,7 @@ cvMaster/
 │  ├─ src/CvMaster.Core/      模型、SQLite 存储、文本提取与容量策略
 │  ├─ src/CvMaster/           WPF 壳层、托盘、热键、剪贴板、粘贴与界面
 │  ├─ src/CvMaster.SmokeTests/核心冒烟与分组隔离测试
-│  ├─ packaging/              Inno Setup 配置（当前不发布安装包）
+│  ├─ packaging/              Inno Setup 配置（Windows 安装包尚未发布）
 │  ├─ build.ps1               构建、测试与自包含发布脚本
 │  └─ README.md               Windows 构建与使用说明
 ├─ docs/                      产品、架构、验证与隐私文档

@@ -2,7 +2,7 @@
 
 Windows 版是原生 .NET 10 / WPF 托盘应用，参考 macOS 版的浮层、分组、筛选、预览与保留策略实现。没有 WebView、没有 Electron、没有后台网络请求。
 
-> 当前仓库处于源码预览阶段，不提供安装包。`packaging/` 中的 Inno Setup 配置仅保留给后续发布流程使用。
+> 当前处于预览阶段，Windows 端不提供安装包（macOS 预览包见仓库 Releases）。`packaging/` 中的 Inno Setup 配置仅保留给后续发布流程使用。
 
 ## 环境
 

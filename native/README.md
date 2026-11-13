@@ -4,7 +4,7 @@
 >
 > since：2026-10-19
 
-> 当前仓库处于源码预览阶段，不提供签名安装包。构建脚本只生成本机 `.build/cvMaster.app`，开发签名不等于 Developer ID 分发签名或公证。数据范围、权限与删除边界见 [`docs/隐私与数据说明.md`](../docs/隐私与数据说明.md)。
+> 当前处于预览阶段。[Releases](https://github.com/helele960108/cvMaster/releases) 中的 macOS 预览包由本脚本构建并使用临时签名，未经公证。构建脚本只生成本机 `.build/cvMaster.app`，开发签名不等于 Developer ID 分发签名或公证。数据范围、权限与删除边界见 [`docs/隐私与数据说明.md`](../docs/隐私与数据说明.md)。
 
 ## 源码结构
 
