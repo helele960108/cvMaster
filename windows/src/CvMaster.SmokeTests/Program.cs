@@ -110,6 +110,33 @@ async Task RunCoreAsync()
     Check("文件预览只展示文件名", preview.Text.Contains("设计说明.txt", StringComparison.Ordinal) && preview.Text.Contains("接口草稿.txt", StringComparison.Ordinal));
     Check("文件预览不暴露完整路径", !preview.Text.Contains(fixture, StringComparison.Ordinal));
 
+    // 文本路径扫描：模拟钉钉 / 企业微信 / 飞书只把路径文本写入剪贴板。
+    static bool LocalExists(string path) => File.Exists(path) || Directory.Exists(path);
+    var single = FilePathScan.TryScanFileList(fileA, StorageLimits.MaximumFileReferences, LocalExists);
+    Check("路径扫描: 单个绝对路径", single is [var only] && only == fileA);
+    var multi = FilePathScan.TryScanFileList(fileA + "\r\n" + fileB, StorageLimits.MaximumFileReferences, LocalExists);
+    Check("路径扫描: 多行路径全部匹配", multi is [var firstPath, var secondPath] && firstPath == fileA && secondPath == fileB);
+    Check("路径扫描: 混合文本拒绝", FilePathScan.TryScanFileList("说明见 " + fileA, StorageLimits.MaximumFileReferences, LocalExists) is null);
+    Check("路径扫描: 相对路径拒绝", FilePathScan.TryScanFileList("readme.md", StorageLimits.MaximumFileReferences, LocalExists) is null);
+    Check("路径扫描: 不存在路径拒绝", FilePathScan.TryScanFileList(Path.Combine(fixture, "不存在.txt"), StorageLimits.MaximumFileReferences, LocalExists) is null);
+    Check("路径扫描: 带引号路径去引号", FilePathScan.TryScanFileList("\"" + fileA + "\"", StorageLimits.MaximumFileReferences, LocalExists) is [var unquoted] && unquoted == fileA);
+    Check("路径扫描: 超过条数上限拒绝", FilePathScan.TryScanFileList(fileA + "\n" + fileB, 1, LocalExists) is null);
+    Check("路径扫描: 目录路径允许", FilePathScan.TryScanFileList(fixture, StorageLimits.MaximumFileReferences, LocalExists) is [var directory] && directory == fixture);
+    Check("路径扫描: 空文本拒绝", FilePathScan.TryScanFileList("   \r\n", StorageLimits.MaximumFileReferences, LocalExists) is null);
+
+    var fileC = Path.Combine(fixture, "会议纪要.txt");
+    await File.WriteAllTextAsync(fileC, "c");
+    var upgradedPathText = fileC;
+    await store.SaveAsync(
+        Capture(ClipKind.File, "会议纪要.txt", new ClipRepresentation(0, "windows/file-list", HistoryStore.EncodeFileList([fileC])), new ClipRepresentation(1, "text/plain", Text(upgradedPathText))),
+        30);
+    var upgradedClip = (await PageAsync(store, "会议纪要")).Clips.First(clip => clip.HasFileReference);
+    var upgradedRepresentations = await store.GetRepresentationsAsync(upgradedClip.Id);
+    Check(
+        "路径升级条目保留纯文本",
+        upgradedRepresentations.Any(item => item.Type == "windows/file-list") &&
+        upgradedRepresentations.Any(item => item.Type == "text/plain" && Encoding.UTF8.GetString(item.Data) == upgradedPathText));
+
     File.Delete(fileB);
     var missingFileFailed = false;
     try
