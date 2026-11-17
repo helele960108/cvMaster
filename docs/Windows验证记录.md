@@ -206,3 +206,25 @@ dotnet run --project src/CvMaster.SmokeTests/CvMaster.SmokeTests.csproj -- --gro
 - 日志时间戳改用 `CultureInfo.InvariantCulture`；快捷键解析改用泛型 `Enum.Parse<Key>`；拆分过长的 P/Invoke 常量声明。
 - 验证：`dotnet build cvMaster.slnx -c Release -p:EnableWindowsTargeting=true` 0 警告、0 错误；`--groups-only` 95/95 通过。
 - 保留 `PasteTargetWorker` / `PasteFocusRestorationRequest` 作为未来原输入焦点恢复的参考实现，但当前生产粘贴路径不引用；文档已明确标注。是否删除或正式接入，应在产品语义确定后单独处理，避免在本次整理中引入行为变化。
+
+## 17. IM 文件路径扫描（2026-10-24）
+
+目标：钉钉、企业微信、飞书复制聊天文件时，部分版本不写 `CF_HDROP`，只把路径文本写入剪贴板；为这类来源增加文件引用识别。实现为三级回退：`CF_HDROP` → `FileNameW`/`FileName` 遗留格式 → 名单内 IM 来源的保守路径文本升级（`FilePathScan`，整段文本必须全部是已存在的本地绝对路径）。范围与边界表见 `docs/Windows版设计.md` 4.4。
+
+对第 13 节规则的一处有意例外：路径文本升级的条目在 `windows/file-list` 之外额外保留 `text/plain` 原文，粘贴到文本框仍得到路径字符串；标准 `CF_HDROP` 条目维持只保存文件列表。
+
+自动化验证（构造与目标 IM 同名的辅助进程 `Feishu.exe` / `DingTalk.exe` / `WXWork.exe`，前台窗口属于该进程后写入剪贴板）：
+
+| 用例 | 写入方式 | 来源进程 | 结果 | 判定 |
+| --- | --- | --- | --- | --- |
+| A 路径文本 | 仅纯文本（文件绝对路径） | Feishu.exe | `文件`，`windows/file-list,text/plain`，标题为文件名 | 通过 |
+| B 路径文本 | 仅纯文本 | DingTalk.exe | `文件`，同上 | 通过 |
+| C 路径文本 | 仅纯文本 | WXWork.exe | `文件`，同上 | 通过 |
+| D 非路径文本 | 多行普通消息 | Feishu.exe | `文本`，不升级 | 通过 |
+| E 路径文本非名单来源 | 仅纯文本 | chrome.exe（前台） | `文本`，不升级 | 通过 |
+| F 遗留格式 | 仅 `FileNameW` | SimImCopy.exe | `文件`，仅 `windows/file-list` | 通过 |
+| G 标准拖放 | `CF_HDROP` | chrome.exe（前台） | `文件`，仅 `windows/file-list`，回归无变化 | 通过 |
+
+- 冒烟测试 **144/144 通过**（默认套件已含分组隔离回归）：新增路径扫描 9 项（单路径、多行、混合文本拒绝、相对路径拒绝、不存在拒绝、去引号、超上限、目录、空文本）与“路径升级条目保留纯文本”；Release 构建 0 警告、0 错误。
+- 本机安装有飞书（未运行），未驱动真实钉钉 / 企业微信 / 飞书界面；真实 IM 的行为差异（如同时附带 HTML）若触发“剪贴板只有纯文本”之外的组合，按边界规则保持纯文本，不会误升级。
+- 验证后已清理全部测试记录与临时文件，恢复 0 条历史、记录关闭状态并重启应用。

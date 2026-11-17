@@ -77,7 +77,7 @@ windows/
 | 源应用 | `NSWorkspace` / bundle ID | 前台窗口 PID + 进程名；排除项按进程名 |
 | 粘贴 | 辅助功能授权后的定向粘贴 | 保存前台 HWND，恢复焦点后 `SendInput` `Ctrl+V` |
 | 图片 | `NSPasteboard` 图片数据 | `PNG` 优先，`CF_DIBV5` / `CF_DIB` 转 PNG |
-| 文件 | 文件 URL | `CF_HDROP`，只保存路径引用 |
+| 文件 | 文件 URL | `CF_HDROP` 优先，`FileNameW`/`FileName` 与 IM 路径文本回退，只保存路径引用 |
 | 敏感标记 | `org.nspasteboard.*` | Windows 隐私标记 + `org.nspasteboard.*` |
 | 外观 | 系统 NSColor / 深色模式 | WPF 资源字典 + DWM 圆角/深色标题栏 |
 | 设置 | SwiftUI Settings Scene | 无边框 WPF 设置窗口 |
@@ -116,11 +116,11 @@ Windows 的 OLE 剪贴板写入经常产生两次连续通知（先清空、再�
 | `text/html` | `HTML Format` | 保留原字节；读取时校验大小 |
 | `text/rtf` | `Rich Text Format` | 预览时解析可见文本 |
 | `image/png` | `PNG` / `CF_DIBV5` / `CF_DIB` | DIB 转 PNG，限制像素数 |
-| `windows/file-list` | `CF_HDROP` | UTF-8、NUL 分隔；最多 100 条 |
+| `windows/file-list` | `CF_HDROP` → `FileNameW`/`FileName` → IM 路径文本 | UTF-8、NUL 分隔；最多 100 条 |
 
 不采集自定义二进制格式、可执行内容或需要执行代码的格式。HTML/RTF 只作为文本表示，不执行脚本、不加载外部资源。
 
-文件引用条目只保存 `windows/file-list`；若同一份剪贴板同时提供像素表示，则图片作为可选表示一并保存，不再写入同一份纯文本，避免部分应用把粘贴结果当成路径文本。必要表示超限时整条拒绝；可选 HTML / RTF / 图片超过单条或总预算时只跳过该表示，不丢弃仍可用的纯文本或文件引用。
+文件引用条目只保存 `windows/file-list`；若同一份剪贴板同时提供像素表示，则图片作为可选表示一并保存，不再写入同一份纯文本，避免部分应用把粘贴结果当成路径文本。唯一的例外是“IM 路径文本升级”条目，见 4.4。必要表示超限时整条拒绝；可选 HTML / RTF / 图片超过单条或总预算时只跳过该表示，不丢弃仍可用的纯文本或文件引用。
 
 ### 4.3 入库
 
@@ -129,6 +129,25 @@ Windows 的 OLE 剪贴板写入经常产生两次连续通知（先清空、再�
 - 资产先写入 UUID 命名的临时/最终文件，再提交数据库事务；失败回收本次新写入的资产。清空历史在事务内删除，随后 best-effort 回收孤立资产并 checkpoint，不执行全库 VACUUM。
 - 数据库启用 WAL、`foreign_keys=ON`、2 MB 页缓存、1.5 s busy timeout。
 - 搜索使用转义后的 `LIKE`，支持中文子串；不宣称 FTS 性能。
+
+### 4.4 文件路径扫描（钉钉 / 企业微信 / 飞书）
+
+钉钉、企业微信、飞书等 IM 复制聊天文件时，部分版本不写 `CF_HDROP`，只把缓存文件的绝对路径写入纯文本。为此文件读取采用三级回退，并对名单内来源启用保守的路径文本升级。
+
+**范围与边界：**
+
+| 场景 | 支持范围 | 明确边界 |
+| --- | --- | --- |
+| 标准文件拖放 | `CF_HDROP`：资源管理器及所有标准应用，最多 100 个引用 | 只保存路径引用，不复制文件本体 |
+| 遗留文件名格式 | 无 `CF_HDROP` 时回退读取 `FileNameW` / `FileName`，来源不限 | 仅承载单个路径；必须是已存在的本地绝对路径，否则按普通文本处理 |
+| IM 路径文本升级 | 来源进程为 `DingTalk.exe`、`DingtalkLauncher.exe`（钉钉）、`WXWork.exe`（企业微信）、`Feishu.exe`、`Lark.exe`（飞书）、`WeChat.exe`、`Weixin.exe`（微信）之一，且剪贴板只有纯文本（无图片 / HTML / RTF / 文件格式），整段文本每一行都是已存在的本地绝对路径 | 任一行不是绝对路径、目标不存在、行数超过 100 或单行超过 1024 字符即整体放弃，保持纯文本；只剥一层成对英文引号；不扫描长文本内部的路径；URL 不参与 |
+| 存在性与安全 | 升级前在采集线程逐一探测路径存在性（文件或目录均可）；敏感标记、来源排除、暂停状态在此之前已生效 | 探测只调用文件系统元数据，不读取文件内容；路径不写入日志 |
+| 升级条目的存储 | 保存 `windows/file-list`（必要）+ `text/plain` 原文（可选）；类型按文件扩展名归入文件或图片 | 普通文件条目仍只保存 `windows/file-list`，不附带文本 |
+| 升级条目的粘贴 | 写回 `FileDrop` + `UnicodeText`：粘贴到文本框得到路径字符串，粘贴到聊天窗口 / 资源管理器由目标应用选择文件表示 | 不自动发送文件；目标应用对 `HDROP` 的处理由其自身决定 |
+| 不支持的文件形式 | 虚拟文件（`FileGroupDescriptorW` + `FileContents`）、`CF_SHELLIDLIST` Shell IDList | 前者需要把内容物化到磁盘，违反“只保存引用”原则；后者解析复杂且三家 IM 均不需要，均明确排除 |
+| 名单维护 | 进程名单硬编码在 `ClipboardMonitor.FilePathTextSources` | 未提供设置界面；新增 IM 需要修改代码并重新发布 |
+
+来源进程按前台窗口判定，可能把实际写入者误记为其他前台应用；该误差与来源排除规则共享同一机制，已在 6.3 说明。macOS 端通过 `public.file-url` 原生识别文件，不涉及本节回退逻辑。
 
 ## 5. 数据与容量
 
