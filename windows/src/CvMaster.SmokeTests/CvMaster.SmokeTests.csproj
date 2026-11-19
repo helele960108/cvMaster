@@ -9,5 +9,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CvMaster.Core\CvMaster.Core.csproj" />
+    <!-- 运行 Windows 托盘的纯逻辑检查，而不让核心冒烟依赖 WPF / Win32。 -->
+    <Compile Include="..\CvMaster\Services\TrayPresentation.cs" Link="TrayPresentation.cs" />
+    <Compile Include="..\CvMaster\Services\TrayIconFrames.cs" Link="TrayIconFrames.cs" />
   </ItemGroup>
 </Project>

@@ -1,4 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
   <title>cvMaster rounded CV mark</title>
-  <path d="M 471 668 H 340 C 245 668 168 598 168 512 C 168 426 245 356 340 356 H 491 Q 501 356 507 366 L 659 646 Q 674 674 690 646 L 856 356" stroke="#242424" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+  <path id="app-mark" d="M 471 668 H 340 C 245 668 168 598 168 512 C 168 426 245 356 340 356 H 491 Q 501 356 507 366 L 659 646 Q 674 674 690 646 L 856 356" stroke="#242424" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+  <defs>
+    <!-- 更短的 C 端点在菜单栏与 16 px 托盘中留出更清楚的开口。 -->
+    <path id="status-mark" d="M 436 668 H 340 C 245 668 168 598 168 512 C 168 426 245 356 340 356 H 491 Q 501 356 507 366 L 649 630 Q 674 676 700 630 L 856 356" stroke="#242424" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+    <g id="pause-mark" fill="#242424">
+      <rect x="790" y="672" width="66" height="148" rx="20"/>
+      <rect x="906" y="672" width="66" height="148" rx="20"/>
+    </g>
+  </defs>
 </svg>

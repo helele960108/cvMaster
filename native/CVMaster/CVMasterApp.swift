@@ -81,6 +81,9 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
     private var activationSubscription: AnyCancellable?
     /// 快捷键变更后同步菜单栏提示，避免注册完成前后读到旧组合。
     private var shortcutSubscription: AnyCancellable?
+    private var recordingStatusSubscription: AnyCancellable?
+    private lazy var activeStatusIcon = makeStatusIcon(named: "StatusIcon", fallback: "clipboard")
+    private lazy var inactiveStatusIcon = makeStatusIcon(named: "StatusIconPaused", fallback: "pause.circle")
     /// 仅记录粘贴阶段与错误码，不记录输入框内容、剪贴板内容或文件名。
     let pasteLogger = Logger(subsystem: "local.helele.cvmaster", category: "paste")
 
@@ -97,23 +100,20 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
                     self?.pasteHandoff.applicationActivated(application?.processIdentifier)
                 }
             }
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        // 22 pt 字标加两侧留白，固定宽度避免暂停与恢复时相邻图标跳动。
+        let item = NSStatusBar.system.statusItem(withLength: 30)
         if let button = item.button {
-            // 独立的单色模板图由系统适配菜单栏明暗，不给标志添加底板。
-            if let image = makeStatusIcon() {
-                button.image = image
-            } else {
-                // 资源异常时保留可识别的入口，不影响用户打开历史列表。
-                button.image = NSImage(systemSymbolName: "clipboard", accessibilityDescription: "cvMaster 剪贴板")
-                button.image?.isTemplate = true
-            }
-            button.toolTip = "cvMaster · \(library.globalShortcut.display)"
             button.target = self
             button.action = #selector(togglePopover)
             // 按下时固定来源 APP，不等 mouse-up；后续不读取或恢复 AX 输入节点。
             button.sendAction(on: [.leftMouseDown])
         }
         statusItem = item
+        updateStatusItemTooltip()
+        recordingStatusSubscription = library.$recordingEnabled.combineLatest(library.$paused)
+            .removeDuplicates(by: ==)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _, _ in self?.updateStatusItemTooltip() }
         popover.delegate = self
         library.validatePasteTarget = { [weak self] in
             guard let self else { throw LibraryError.pasteTargetUnavailable }
@@ -193,16 +193,30 @@ final class StatusAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegat
         popover.contentViewController?.view.appearance = nativeAppearance
     }
 
-    /// 裁去主图的大幅留白后等比显示 CV；模板图由系统负责明暗及选中态着色。
-    /// 启动时只加载一次，不在轮询或列表刷新时重新绘制。
-    private func makeStatusIcon() -> NSImage? {
-        guard let url = Bundle.main.url(forResource: "StatusIcon", withExtension: "png"),
-              let image = NSImage(contentsOf: url), image.size.width > 0, image.size.height > 0 else { return nil }
-        let side: CGFloat = 18
-        let scale = side / max(image.size.width, image.size.height)
-        image.size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+    /// 只反映持久的用户开关，不把锁屏等临时隐私拦截显示成手动暂停。
+    func updateStatusItemTooltip() {
+        guard let button = statusItem?.button else { return }
+        let shortcut = library.shortcutAvailable ? library.globalShortcut.display : "快捷键不可用，请点击图标"
+        let presentation = StatusIconPresentation(recordingEnabled: library.recordingEnabled,
+                                                  paused: library.paused, shortcut: shortcut)
+        let image = presentation.inactive ? inactiveStatusIcon : activeStatusIcon
+        if button.image !== image { button.image = image }
+        button.toolTip = presentation.tooltip
+    }
+
+    /// 两种状态资源按相同宽度等比显示；AppKit 负责明暗及选中态着色。
+    private func makeStatusIcon(named name: String, fallback: String) -> NSImage? {
+        let description = fallback == "clipboard" ? "cvMaster 剪贴板" : "cvMaster 剪贴板未记录"
+        guard let url = Bundle.main.url(forResource: name, withExtension: "png"),
+              let image = NSImage(contentsOf: url), image.size.width > 0, image.size.height > 0 else {
+            let image = NSImage(systemSymbolName: fallback, accessibilityDescription: description)
+            image?.isTemplate = true
+            return image
+        }
+        let width: CGFloat = 22
+        image.size = NSSize(width: width, height: image.size.height * width / image.size.width)
         image.isTemplate = true
-        image.accessibilityDescription = "cvMaster 剪贴板"
+        image.accessibilityDescription = description
         return image
     }
 

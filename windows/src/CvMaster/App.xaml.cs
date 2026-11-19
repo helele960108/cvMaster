@@ -4,9 +4,11 @@
  * @author helele
  * @since 2026-10-19
  */
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Threading;
 using CvMaster.Services;
+using CvMaster.ViewModels;
 using CvMaster.Views;
 using Microsoft.Win32;
 
@@ -58,9 +60,10 @@ public partial class App : Application
                 {
                     Services.Library.Paused = !Services.Library.Paused;
                     Services.Library.SetFeedback(Services.Library.Paused ? "剪贴板记录已暂停" : "剪贴板记录已恢复");
-                });
-            Services.Tray.UpdateTooltip(
-                $"cvMaster · {Services.Library.ShortcutDisplay}{(Services.Library.Paused ? " · 已暂停" : string.Empty)}");
+                },
+                getPresentation: lightTaskbar => TrayPresentation.Create(lightTaskbar,
+                    Services.Library.RecordingEnabled, Services.Library.Paused, Services.Library.ShortcutDisplay));
+            Services.Library.PropertyChanged += OnTrayStateChanged;
             Services.StartMonitoring();
             _singleInstance.StartListener(Dispatcher, ShowPanel);
             SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
@@ -139,6 +142,10 @@ public partial class App : Application
         AppLog.Info("shutdown");
 
         SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+        if (Services is not null)
+        {
+            Services.Library.PropertyChanged -= OnTrayStateChanged;
+        }
 
         try
         {
@@ -180,11 +187,32 @@ public partial class App : Application
         }
     }
 
+    private void OnTrayStateChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(LibraryViewModel.RecordingEnabled) or nameof(LibraryViewModel.Paused) or
+            nameof(LibraryViewModel.ShortcutDisplay))
+        {
+            Services.Tray?.RefreshPresentation();
+        }
+    }
+
     private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
     {
-        if (e.Category == UserPreferenceCategory.General || e.Category == UserPreferenceCategory.Color)
+        if (e.Category is UserPreferenceCategory.General or UserPreferenceCategory.Color or UserPreferenceCategory.Accessibility)
         {
-            Dispatcher.BeginInvoke(() => Services.Theme.RefreshSystemAppearance());
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (IsShuttingDown)
+                {
+                    return;
+                }
+
+                Services.Tray?.RefreshSystemAppearance();
+                if (e.Category is UserPreferenceCategory.General or UserPreferenceCategory.Color)
+                {
+                    Services.Theme.RefreshSystemAppearance();
+                }
+            });
         }
     }
 

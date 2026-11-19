@@ -9,7 +9,8 @@ using CvMaster.Core;
 using CvMaster.SmokeTests;
 using Microsoft.Data.Sqlite;
 
-var groupsOnly = args.Contains("--groups-only", StringComparer.Ordinal);
+var trayOnly = args.Contains("--tray-only", StringComparer.Ordinal);
+var groupsOnly = !trayOnly && args.Contains("--groups-only", StringComparer.Ordinal);
 var checks = 0;
 var failures = new List<string>();
 var root = Path.Combine(Path.GetTempPath(), "cvMaster-smoke-" + Guid.NewGuid().ToString("N"));
@@ -269,12 +270,24 @@ try
 {
     if (!groupsOnly)
     {
-        await RunSuiteAsync("Core", RunCoreAsync);
+        await RunSuiteAsync("Tray", () =>
+        {
+            TrayChecks.Run(Check);
+            return Task.CompletedTask;
+        });
     }
 
-    await RunSuiteAsync("Groups", () => GroupChecks.RunAsync(
-        Path.Combine(root, "groups"), Check, Capture,
-        (groupStore, scope) => PageAsync(groupStore, scope: scope)));
+    if (!trayOnly)
+    {
+        if (!groupsOnly)
+        {
+            await RunSuiteAsync("Core", RunCoreAsync);
+        }
+
+        await RunSuiteAsync("Groups", () => GroupChecks.RunAsync(
+            Path.Combine(root, "groups"), Check, Capture,
+            (groupStore, scope) => PageAsync(groupStore, scope: scope)));
+    }
 }
 finally
 {

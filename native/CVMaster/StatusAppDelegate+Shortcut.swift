@@ -80,11 +80,4 @@ extension StatusAppDelegate {
             ? "该组合已被其他应用占用，请换一个组合"
             : "无法注册该快捷键（错误 \(status)）"
     }
-
-    /// 菜单栏提示跟随当前组合与注册状态，不永久显示默认键。
-    func updateStatusItemTooltip() {
-        statusItem?.button?.toolTip = library.shortcutAvailable
-            ? "cvMaster · \(library.globalShortcut.display)"
-            : "cvMaster · 快捷键不可用，请点击图标"
-    }
 }

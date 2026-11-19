@@ -49,14 +49,16 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 ## 应用图标
 
-使用与 macOS 一致的透明底、单色圆润 CV 标志。主图为 `native/Resources/AppIcon.png`，矢量源为相邻的 `AppIcon.svg`；不再生成旧铜橙剪贴板。安装 Python / Pillow 后，在仓库根目录执行：
+两端共用 `native/Resources/AppIcon.svg`。Windows 的应用及快捷方式使用嵌入 EXE 的 `Assets/app.ico`；托盘另用为小尺寸优化的 CV，按系统任务栏（不是应用浮层）的明暗切换字标颜色。四种托盘资源随程序集打包，包含 16–256 px 九个尺寸，单文件发布不需额外复制图标。
+
+未开启记录和手动暂停均显示 CV 加双竖条，悬停提示分别为“未开启记录”和“已暂停记录”。正常时只显示 CV；锁屏等临时隐私拦截不改变图标。图标更新后须重新构建并重启应用。
+
+日常 Windows 构建直接使用已生成的资源。若修改源 SVG，请在 macOS 上安装 Python 3.9+ / Pillow 后从仓库根目录重新生成；资源校验也可单独在 Windows 上执行：
 
 ```bash
-python3 windows/tools/generate-icon.py
+./native/scripts/generate-icon.sh
 python3 windows/tools/check-icons.py
 ```
-
-生成 `Assets/app.png`（1024 px）及九尺寸 `Assets/app.ico`（16–256 px）。ICO 编译嵌入 EXE，托盘和快捷方式取 EXE 内嵌图标，因此更换后须重新构建并退出旧进程再启动；仅复制 Assets 不会更新运行中的托盘。Windows 使用固定深色标志，浅 / 深色任务栏下的实际对比度仍需 Windows 人工验收，不宣称像 macOS 模板图一样自动反色。
 
 ## 本地部署
 

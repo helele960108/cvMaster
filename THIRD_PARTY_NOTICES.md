@@ -47,7 +47,7 @@
 
 ### Pillow
 
-- 用途：`windows/tools/generate-icon.py` 的可选构建工具依赖，不随应用分发。
+- 用途：`native/scripts/generate-icons.py` 与 `windows/tools/check-icons.py` 的可选图标生成及验证依赖，不随应用分发。
 - 许可证：MIT-CMU
 - 来源：https://python-pillow.org/
 

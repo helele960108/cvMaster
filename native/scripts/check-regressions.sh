@@ -47,6 +47,7 @@ xcrun swiftc -O -swift-version 6 -target "$ARCH-apple-macosx26.5" -sdk "$SDK" \
   "$ROOT/CVMaster/ClipTimeRange.swift" \
   "$ROOT/CVMaster/Preferences.swift" \
   "$ROOT/CVMaster/GlobalShortcut.swift" \
+  "$ROOT/CVMaster/StatusIconPresentation.swift" \
   "$ROOT/CVMaster/SingleInstanceLock.swift" \
   "$ROOT"/CVMaster/HistoryStore*.swift \
   "$ROOT/CVMaster/FileAvailability.swift" \

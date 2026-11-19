@@ -24,6 +24,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- 随 WPF 应用程序集打包，单文件发布也不需要旁置托盘图标。 -->
+    <Resource Include="Assets\tray-dark.ico;Assets\tray-light.ico;Assets\tray-dark-paused.ico;Assets\tray-light-paused.ico" />
     <None Update="Assets\app.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

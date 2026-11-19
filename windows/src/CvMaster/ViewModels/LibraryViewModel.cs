@@ -84,7 +84,6 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
     public event EventHandler? ScopeChanged;
     public event EventHandler? SearchCriteriaChanged;
     public event EventHandler? SelectionScrollRequested;
-    public event EventHandler? StateChanged;
 
     public ClipboardMonitor? Monitor { get; set; }
 
@@ -346,7 +345,6 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
             Monitor?.ResetBaseline();
             OnPropertyChanged();
             OnPropertyChanged(nameof(RecordingBannerVisible));
-            StateChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 
@@ -368,7 +366,6 @@ public sealed class LibraryViewModel : INotifyPropertyChanged, IDisposable
             Monitor?.ResetBaseline();
             OnPropertyChanged();
             OnPropertyChanged(nameof(PausedVisible));
-            StateChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 

@@ -43,6 +43,7 @@ struct RegressionChecks {
                 ("pure privacy gate and per-item capture budgets", capturePolicy),
                 ("session lock resolver fails closed and blocks capture", sessionLock),
                 ("default shortcut, saved preferences and reset round trips", globalShortcut),
+                ("menu bar recording states and tooltip parity", statusIconPresentation),
                 ("pure paste handoff request binding and focus transitions", pasteHandoff),
                 ("pure paste focus restoration single-use permits and cancellation", pasteFocusRestoration)
             ]

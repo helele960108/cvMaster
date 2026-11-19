@@ -97,9 +97,11 @@ open ./native/.build/cvMaster.app
 
 ## 应用图标
 
-使用已确认的单色圆润 CV 字标，不再保留暖白 / 铜橙剪贴板图案或彩色底板。矢量源为 `Resources/AppIcon.svg`，透明深色主图为 `Resources/AppIcon.png`，标准 macOS 多尺寸图标为 `Resources/AppIcon.icns`，由 `CFBundleIconFile` 引用。
+macOS 和 Windows 共用 `Resources/AppIcon.svg`，其中保存应用字标、小尺寸字标和暂停标记。应用图标保持原来的圆润 CV 造型；菜单栏使用开口更宽的 CV 模板图，等比显示为 22 pt 宽，状态栏槽位固定为 30 pt，并由 AppKit 按系统背景和选中态着色。
 
-更换主图后执行 `./native/scripts/generate-icon.sh`，生成 16–1024 px 普通与 Retina 尺寸及 `Resources/StatusIcon.png`，再构建应用。菜单栏使用单独裁去留白的 CV 透明模板图，最长边 18 pt、保持宽高比，由系统适配明暗和选中态；不添加底板或圆角裁剪。图标仅在启动时加载，资源不可用时回退到系统剪贴板符号。Windows 图标也由该主图派生；安装 Python / Pillow 后，可执行 `python3 windows/tools/check-icons.py` 检查两端资源一致性。
+两端均在未开启记录或手动暂停时显示 CV 加双竖条，悬停文字分别为“未开启记录”和“已暂停记录”。正常时只显示 CV；锁屏等临时隐私拦截不改变图标。切换状态不改变 CV 的位置和大小。
+
+更新 SVG 后，在 macOS 安装 Python 3.9+ / Pillow，从仓库根目录运行 `./native/scripts/generate-icon.sh`，同时生成两端资源；用 `python3 windows/tools/check-icons.py` 校验。生成工具使用 macOS 的 `sips` 和 `iconutil`；日常应用构建直接使用仓库中的派生资源，无需额外安装 Python 或 Pillow。
 
 ## 纯文本粘贴
 

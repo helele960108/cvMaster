@@ -60,14 +60,10 @@ public partial class QuickPanelWindow : Window
         };
         _vm.SearchCriteriaChanged += (_, _) => ClosePreviewImmediate();
         _vm.SelectionScrollRequested += (_, _) => ScrollSelectionIntoView();
-        _vm.StateChanged += (_, _) => UpdateTrayTooltip();
         _vm.PropertyChanged += (_, args) =>
         {
             switch (args.PropertyName)
             {
-                case nameof(LibraryViewModel.ShortcutDisplay):
-                    UpdateTrayTooltip();
-                    break;
                 case nameof(LibraryViewModel.KindFilter):
                     UpdateTypeChips();
                     break;
@@ -80,7 +76,6 @@ public partial class QuickPanelWindow : Window
         UpdateTypeChips();
         UpdateTimeFilterVisuals();
         UpdateSearchChrome();
-        UpdateTrayTooltip();
     }
 
     public LibraryViewModel ViewModel => _vm;
@@ -947,12 +942,6 @@ public partial class QuickPanelWindow : Window
         {
             ClipList.ScrollIntoView(row);
         }
-    }
-
-    private void UpdateTrayTooltip()
-    {
-        var suffix = _vm.Paused ? " · 已暂停" : string.Empty;
-        App.Services.Tray?.UpdateTooltip($"cvMaster · {_vm.ShortcutDisplay}{suffix}");
     }
 
     private void UpdateResizeGripPlacement(PanelPlacement placement)
