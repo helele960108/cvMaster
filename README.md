@@ -35,7 +35,7 @@ xattr -dr com.apple.quarantine /Applications/cvMaster.app
 
 临时签名的辅助功能授权绑定具体构建，升级新版本后可能需要在「系统设置 › 隐私与安全性 › 辅助功能」中删除旧条目再重新授权。Release 说明里附有 SHA-256，可用 `shasum -a 256` 核对。
 
-Windows 预览包同样在 [Releases](https://github.com/helele960108/cvMaster/releases)，要求 Windows 10/11 x64。下载 `cvMaster-Setup-<版本>.exe` 后双击安装：默认装到当前用户目录，不需要管理员权限，会自动创建开始菜单快捷方式。安装包没有代码签名，SmartScreen 可能提示「已保护你的电脑」，需要点「更多信息 › 仍要运行」。安装包同样未附带 .NET 运行时，因为发布方式为自包含。
+Windows 预览包同样在 [Releases](https://github.com/helele960108/cvMaster/releases)，要求 Windows 10/11 x64。下载 `cvMaster-Setup-<版本>.exe` 后双击安装：默认装到当前用户目录，不需要管理员权限，会自动创建开始菜单快捷方式。发布方式为自包含，目标机器无需预装 .NET。安装包没有代码签名，SmartScreen 可能提示「已保护你的电脑」，需要点「更多信息 › 仍要运行」。
 
 卸载请通过「设置 › 应用」或开始菜单中的卸载项；卸载不会删除 `%LOCALAPPDATA%\cvMaster` 中的历史与设置，需要自行删除。Release 说明里附有 SHA-256，可用 `Get-FileHash <文件> -Algorithm SHA256` 核对。
 
