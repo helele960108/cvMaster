@@ -2,14 +2,14 @@
 
 本地优先的剪贴板管理工具。macOS 版是菜单栏应用，Windows 版是原生 WPF 托盘应用；两端共享同一套产品约束：默认不记录、只在本机工作、内容不进入日志、大内容按需读取。
 
-**项目状态：0.1.0 预览版。** [Releases](https://github.com/helele960108/cvMaster/releases) 提供 macOS（Apple Silicon）预览包，未经 Apple 公证；Windows 暂不提供安装包，需从源码构建。macOS 与 Windows 的界面、权限和跨应用粘贴仍在持续验收，不能把现有测试结果理解为面向所有环境的稳定版承诺。
+**项目状态：0.1.1 预览版。** [Releases](https://github.com/helele960108/cvMaster/releases) 提供 macOS（Apple Silicon）与 Windows x64 预览包，两端均未做代码签名或公证，首次打开会被系统拦截。macOS 与 Windows 的界面、权限和跨应用粘贴仍在持续验收，不能把现有测试结果理解为面向所有环境的稳定版承诺。
 
 ## 平台与支持范围
 
 | 平台 | 运行形态 | 技术栈 | 构建环境 | 当前状态 |
 | --- | --- | --- | --- | --- |
 | macOS | 菜单栏图标 + `⇧⌘V` 浮层 | SwiftUI + AppKit | Apple Silicon、macOS 26.5+、Swift 6.4 / Xcode 26.5+ | 隔离回归与构建通过；GUI / TCC / 多屏验收仍待完成 |
-| Windows | 托盘图标 + `Alt+Space` 浮层 | .NET 10 + WPF | Windows 10/11、.NET SDK 10.0.402+ | 当前快照已交叉编译通过；仍需 Windows 运行与交互验收 |
+| Windows | 托盘图标 + `Alt+Space` 浮层 | .NET 10 + WPF | Windows 10/11、.NET SDK 10.0.402+ | 安装包与托盘图标已在 Windows 11 实机验证；混合 DPI 与深色任务栏仍待验收 |
 
 两套实现都是原生应用：没有 Electron、没有 WebView 包装，也不共享 UI 层。Windows 版把领域与 SQLite 存储放在无 UI 的 `CvMaster.Core`，便于独立测试。
 
@@ -35,7 +35,9 @@ xattr -dr com.apple.quarantine /Applications/cvMaster.app
 
 临时签名的辅助功能授权绑定具体构建，升级新版本后可能需要在「系统设置 › 隐私与安全性 › 辅助功能」中删除旧条目再重新授权。Release 说明里附有 SHA-256，可用 `shasum -a 256` 核对。
 
-Windows 暂无安装包，请按下文从源码构建。
+Windows 预览包同样在 [Releases](https://github.com/helele960108/cvMaster/releases)，要求 Windows 10/11 x64。下载 `cvMaster-Setup-<版本>.exe` 后双击安装：默认装到当前用户目录，不需要管理员权限，会自动创建开始菜单快捷方式。安装包没有代码签名，SmartScreen 可能提示「已保护你的电脑」，需要点「更多信息 › 仍要运行」。安装包同样未附带 .NET 运行时，因为发布方式为自包含。
+
+卸载请通过「设置 › 应用」或开始菜单中的卸载项；卸载不会删除 `%LOCALAPPDATA%\cvMaster` 中的历史与设置，需要自行删除。Release 说明里附有 SHA-256，可用 `Get-FileHash <文件> -Algorithm SHA256` 核对。
 
 ## 快速开始
 

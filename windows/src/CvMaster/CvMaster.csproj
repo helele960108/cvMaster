@@ -8,8 +8,8 @@
     <RootNamespace>CvMaster</RootNamespace>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>0.1.0</Version>
-    <FileVersion>0.1.0.0</FileVersion>
+    <Version>0.1.1</Version>
+    <FileVersion>0.1.1.0</FileVersion>
     <Product>cvMaster</Product>
     <Company>helele</Company>
     <Description>本地优先的 Windows 剪贴板管理工具</Description>

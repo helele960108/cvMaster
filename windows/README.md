@@ -2,7 +2,7 @@
 
 Windows 版是原生 .NET 10 / WPF 托盘应用，参考 macOS 版的浮层、分组、筛选、预览与保留策略实现。没有 WebView、没有 Electron、没有后台网络请求。
 
-> 当前处于预览阶段，Windows 端不提供安装包（macOS 预览包见仓库 Releases）。`packaging/` 中的 Inno Setup 配置仅保留给后续发布流程使用。
+> 当前处于预览阶段。仓库 [Releases](https://github.com/helele960108/cvMaster/releases) 提供 x64 安装包 `cvMaster-Setup-<版本>.exe`（未签名，自包含运行时，装到当前用户目录，不需要管理员权限）。下文的源码构建与部署脚本供开发使用；`packaging/cvMaster.iss` 是发布安装包的 Inno Setup 配置。
 
 ## 环境
 
@@ -46,6 +46,22 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - `%ProgramFiles%\dotnet\dotnet.exe`
 - `%ProgramFiles(x86)%\dotnet\dotnet.exe`
 - `%USERPROFILE%\.dotnet\dotnet.exe`
+
+## 打包安装程序
+
+安装包用 Inno Setup 6 编译，配置在 `packaging/cvMaster.iss`，需要先有自包含发布产物 `dist/win-x64/`：
+
+```powershell
+# 1. 构建并发布自包含产物（默认含冒烟测试）
+.\build.ps1
+
+# 2. 编译安装包，输出 dist/installer/cvMaster-Setup-<版本>.exe
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" .\packaging\cvMaster.iss
+```
+
+版本号有三处需保持同步：`src/CvMaster/CvMaster.csproj` 的 `Version` / `FileVersion`，以及 `packaging/cvMaster.iss` 的 `AppVersion` / `VersionInfoVersion`。
+
+安装包按以下行为编译：最小权限（`PrivilegesRequired=lowest`，装到 `%LOCALAPPDATA%`）、`x64compatible`、LZMA2 ultra64 压缩、简体中文向导、`AppMutex` 防止覆盖正在运行的实例。静默安装用 `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`；卸载不会删除 `%LOCALAPPDATA%\cvMaster` 中的用户数据。
 
 ## 应用图标
 

@@ -228,3 +228,97 @@ dotnet run --project src/CvMaster.SmokeTests/CvMaster.SmokeTests.csproj -- --gro
 - 冒烟测试 **144/144 通过**（默认套件已含分组隔离回归）：新增路径扫描 9 项（单路径、多行、混合文本拒绝、相对路径拒绝、不存在拒绝、去引号、超上限、目录、空文本）与“路径升级条目保留纯文本”；Release 构建 0 警告、0 错误。
 - 本机安装有飞书（未运行），未驱动真实钉钉 / 企业微信 / 飞书界面；真实 IM 的行为差异（如同时附带 HTML）若触发“剪贴板只有纯文本”之外的组合，按边界规则保持纯文本，不会误升级。
 - 验证后已清理全部测试记录与临时文件，恢复 0 条历史、记录关闭状态并重启应用。
+
+## 18. 双平台状态图标与记录提示（2026-11-26）
+
+对应提交 `0d7166f`（`feat(icon): 统一双平台状态图标与记录提示`）。Windows 端把托盘图标从“提取 EXE 内嵌图标”改为按任务栏明暗与记录状态选择专用资源，并把状态联动从浮层窗口搬到 `App`。
+
+### 实现要点
+
+- 新增四份托盘资源 `Assets/tray-{dark,light}[-paused].ico`，各含 16/20/24/32/40/48/64/128/256 九个尺寸，随程序集打包（`<Resource>`），单文件发布不需要旁置文件。
+- `TrayPresentation.Create` 集中决定资源路径与提示：任务栏为浅色时用深色字标、深色任务栏用白色字标；未开启记录与手动暂停共用 `-paused` 资源；提示分别追加“· 未开启记录”“· 已暂停记录”，正常态不追加后缀。
+- `TrayIconImages` 按（资源, 尺寸）缓存 HICON，用 `CreateIconFromResourceEx` 从 ICO 中挑出的单帧创建，不使用 `LR_SHARED`，释放时显式 `DestroyIcon`；读取失败也缓存，避免每次通知重开资源。读取失败回退到 EXE 内嵌图标，再回退系统默认图标。
+- `TrayIconFrames.Select` 只把 ICO 目录中最合适的一帧交给 user32（精确尺寸优先，其次优先下采样而不放大），并跳过越界/截断目录项。
+- 图标尺寸取主任务栏 `Shell_TrayWnd` 的 DPI 下 `SM_CXSMICON`，隐藏的托盘窗口自身不跟随任务栏移动；未提供 `SystemUsesLightTheme` 时按经典深色任务栏处理，高对比模式改用系统窗口配色判断。
+- 响应 `TaskbarCreated`、`WM_SETTINGCHANGE`、`WM_SYSCOLORCHANGE`、`WM_THEMECHANGED`、`WM_DISPLAYCHANGE`、`WM_DPICHANGED`，合并为一次延迟刷新；仅在图标或提示实际变化时才 `NIM_MODIFY`。
+- 浮层里的 `StateChanged` 事件与 `UpdateTrayTooltip` 已删除，改由 `App` 订阅 `LibraryViewModel.PropertyChanged`（`RecordingEnabled` / `Paused` / `ShortcutDisplay`）驱动；`ShortcutDisplay` 改变不再依赖浮层是否创建过。
+
+### 自动化验证
+
+- `windows/build.ps1 -SkipPublish`：Release 构建 **0 警告、0 错误**。
+- `CvMaster.SmokeTests`：**ALL PASS (155 checks)**，含新增 11 项托盘检查（`--tray-only` 可单独重跑，本机结果 `ALL PASS (11 checks)`）：
+  - 浅色 / 深色任务栏各 3 项：字标取反色、未开启与暂停使用同一资源、提示保留快捷键并区分两种非记录状态；
+  - ICO 帧选择 5 项：150% DPI 精确匹配、缺少精确尺寸时优先下采样、目录 0 尺寸代表 256、拒绝截断目录、跳过偏移越界帧。
+- `python -I windows/tools/check-icons.py`：`PASS: shared SVG, app assets, two unchanged-size states, and four nine-size tray icons`。校验共享 SVG 几何（`app-mark`/`status-mark`/`pause-mark`）、两端 PNG 主图一致、ICNS 标准与 Retina 帧、四份 ICO 的九个尺寸、明暗两套形状透明度一致、暂停标记确实是两条分离竖条、四个托盘资源已嵌入 csproj。
+- `dotnet format cvMaster.slnx --verify-no-changes --include <本次改动文件>`：10/10 无差异。仓库另有 46 个历史文件在工作区为 CRLF（`.gitattributes` 要求 LF，`core.autocrlf=true` 导致），`--verify-no-changes` 全量运行会报 3720 条 `ENDOFLINE`；本次提交未触及这些文件，属于既有环境差异，不是本轮回归。
+
+### Windows 实机交互验证（本机 Windows 11 build 26300、x64、125% DPI、浅色任务栏）
+
+用 `bin/Release` 产物启动，通过 UI Automation 读取托盘元素名称与截图核对字形：
+
+| 状态 | 图标 | 悬停提示 | 判定 |
+| --- | --- | --- | --- |
+| 记录开启、未暂停 | 深色 CV，无附加标记 | `cvMaster · Alt+Space` | 通过 |
+| 手动暂停（更多操作 → 暂停记录） | CV + 右下双竖条 | `cvMaster · Alt+Space · 已暂停记录` | 通过 |
+| 关闭记录（设置页「允许记录剪贴板」） | CV + 双竖条（与暂停同一资源） | `cvMaster · Alt+Space · 未开启记录` | 通过 |
+
+- 浅色任务栏下字标为深色单色（实测字形像素集中在 `#161616` 附近，无彩色边缘），符合“与任务栏相反色”的设计；暂停标记实测为 CV 右下两条分离竖条。
+- 三种状态切换均在一次运行内即时生效，无需重启：暂停由浮层菜单触发、关闭记录由设置页开关触发，图标与提示随之更新。
+- 状态持久化一致：暂停写 `Paused=1`、恢复写 `Paused=0`，记录开关写 `RecordingEnabled`，与图标表现同步。
+
+### 未覆盖项
+
+- 深色任务栏（`SystemUsesLightTheme=0`）本轮未切换主题实测，仅由 `TrayChecks` 与 `check-icons.py` 覆盖资源选择与白色字标形状；高对比模式同样未实机验证。
+- 任务栏位置变化、混合 DPI 多显示器、`WM_DPICHANGED` 与 Explorer 重启（`TaskbarCreated`）未在本轮触发实测。
+- macOS 端本次同步改动为 SwiftUI/AppKit（`StatusIconPresentation.swift`、`ChecksStatusIcon.swift` 等），本机无 Swift 工具链，未编译运行。
+
+### 环境恢复
+
+- 测试实例已退出，`RecordingEnabled=1`、`Paused=0` 恢复为验证前状态，`OnboardingShown=1` 保留；历史仍为 0 条（`entry`/`user_group`/`entry_group`/`representation` 全为 0）。
+- 未执行部署脚本，未安装或卸载应用，未改动 `%LOCALAPPDATA%\Programs\cvMaster` 中的既有安装；未修改、未提交任何仓库文件（本节除外）。
+- 本机 `dotnet` 不在 `PATH`，且 `C:\Program Files\dotnet` 只有运行时没有 SDK；构建时把 `%LOCALAPPDATA%\Microsoft\dotnet` 前置到 `PATH`（该目录含 SDK 10.0.402）。`build.ps1` 的 `Resolve-DotNet` 会优先命中 `Get-Command dotnet`，因此在 `Program Files` 安装 SDK 或调整 PATH 顺序前，直接运行脚本会失败。
+
+## 19. 首个 Windows 安装包（2026-11-26）
+
+首次产出 Windows 安装包并发布到 GitHub Releases。版本从 `v0.1.0`（tag 在 `0f4f78d`）升到 `v0.1.1`，因为当前 HEAD 比 tag 多 4 个提交（IM 文件路径三级回退、双平台状态图标）。
+
+### 版本与打包配置
+
+- `src/CvMaster/CvMaster.csproj`：`Version` / `FileVersion` 从 `0.1.0` / `0.1.0.0` 改为 `0.1.1` / `0.1.1.0`。
+- `packaging/cvMaster.iss`：`AppVersion` / `VersionInfoVersion` 同步为 `0.1.1` / `0.1.1.0`。
+- 安装包沿用既有配置：`PrivilegesRequired=lowest`、`DefaultDirName={localappdata}\Programs\cvMaster`、`ArchitecturesAllowed=x64compatible`、LZMA2 ultra64、简体中文向导、`AppMutex=Local\cvMaster.Instance`、卸载跳过用户数据目录。
+- 打包工具：Inno Setup 6.7.3，`winget` 装在用户目录 `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`（不是 `Program Files (x86)`，脚本查找时注意）。
+
+### 构建与产物
+
+| 项目 | 结果 |
+| --- | --- |
+| `build.ps1`（Release + 冒烟 + 自包含发布） | `ALL PASS (155 checks)`，0 警告、0 错误 |
+| 发布产物 | `dist/win-x64/`，134.5 MB，`cvMaster.exe` FileVersion `0.1.1.0` |
+| ProductVersion | `0.1.1+0d7166fc8eadf839a05d8198210f406b5f12558d`（带提交号） |
+| 安装包 | `dist/installer/cvMaster-Setup-0.1.1.exe`，43.67 MB |
+| 安装包 SHA-256 | `10e04413a42c75b20adceb0bc78cc7515e71b0ef45555e904fad972e9b531438` |
+
+### 安装包实测
+
+静默安装（`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`）：
+
+- 退出码 0；装到 `%LOCALAPPDATA%\Programs\cvMaster`，251 个文件。
+- `cvMaster.exe` FileVersion 变为 `0.1.1.0`，覆盖升级了原有的 0.1.0 安装。
+- 开始菜单快捷方式 `cvMaster.lnk` 创建成功；卸载项 `cvMaster (当前用户) 0.1.1` 注册到 `HKCU`。
+- 启动后进程存活且 `Responding=True`，`%LOCALAPPDATA%\cvMaster\logs` 记录 `startup` 无错误。
+- 托盘图标确认打包在程序集内：安装目录没有独立 `tray-*.ico` 文件，符合“单文件发布不需旁置图标”的设计。
+- 用户数据未被改动，`history.sqlite` 保持 0 条记录。
+
+静默卸载：
+
+- 退出码 0；开始菜单快捷方式与 `HKCU` 卸载项均已移除；`%LOCALAPPDATA%\cvMaster` 中的历史与设置保留（符合设计）。
+- 残留两个空目录 `Programs\cvMaster\Assets` 与 `Programs\cvMaster\zh-Hans`，不含任何文件。这是 Inno Setup 对空子目录的已知行为，不影响后续重装。
+
+### 未覆盖项
+
+- 未验证图形化安装向导的界面与文案（使用静默模式），也未验证「创建桌面快捷方式」勾选项与 `/DIR=` 自定义安装目录。
+- 本次静默安装实际落到默认目录而非传入的 `/DIR=`：PowerShell `Start-Process` 的数组传参把 `/DIR=` 和路径拆成了两个参数。后续验证自定义目录应改用 `-ArgumentList '/DIR="<路径>"'` 单字符串形式。
+- 安装包未做 Authenticode 代码签名，SmartScreen 拦截提示未实测截图。
+- arm64 安装包未构建（`ArchitecturesAllowed=x64compatible`，需另配）。
+- 安装覆盖了本机原有的 0.1.0 安装，卸载后未重新安装；`%LOCALAPPDATA%\Programs\cvMaster` 现仅剩两个空目录。

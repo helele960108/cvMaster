@@ -1,5 +1,5 @@
 #define AppName "cvMaster"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppPublisher "helele"
 #define AppExeName "cvMaster.exe"
 
@@ -30,7 +30,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
 RestartApplications=no
 AppMutex=Local\cvMaster.Instance
-VersionInfoVersion=0.1.0.0
+VersionInfoVersion=0.1.1.0
 VersionInfoCompany={#AppPublisher}
 VersionInfoDescription=cvMaster Windows 安装程序
 VersionInfoProductName={#AppName}
